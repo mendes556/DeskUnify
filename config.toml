@@ -1,3 +1,4 @@
+# DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 # example configuration
 
 # configure release bind
@@ -6,10 +7,14 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# optional Windows/macOS plain-text clipboard sync (defaults to false)
+# enable on both paired devices; also allow TCP on the configured port
+clipboard = false
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
-"bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
+# Empty by default. Verify fingerprints on both machines, then use cli pair.
 
 # define a client on the right side with host name "iridium"
 [[clients]]

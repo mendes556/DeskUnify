@@ -1,3 +1,4 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -29,7 +30,8 @@ pub(crate) enum ICaptureEvent {
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
-    CaptureEnabled,
+    CaptureEnabled(String),
+    CaptureFailed(String),
     /// A (new) client was entered.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
     /// event is only triggered when the capture was
@@ -56,8 +58,10 @@ pub(crate) enum CaptureType {
     EnterOnly,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum CaptureRequest {
+    SetPaused(bool, tokio::sync::oneshot::Sender<Result<(), String>>),
+    ReleaseConfirmed(tokio::sync::oneshot::Sender<Result<(), String>>),
     /// capture must release the mouse
     Release,
     /// add a capture client
@@ -80,6 +84,7 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
+            paused: false,
             active_client: None,
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -103,6 +108,28 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::Reenable)
             .expect("channel closed");
+    }
+
+    pub(crate) async fn set_paused(&self, paused: bool) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.request_tx
+            .send(CaptureRequest::SetPaused(paused, reply))
+            .map_err(|_| "capture task stopped".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .map_err(|_| "capture pause timed out".to_owned())?
+            .map_err(|_| "capture task stopped".to_owned())?
+    }
+
+    pub(crate) async fn release_confirmed(&self) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.request_tx
+            .send(CaptureRequest::ReleaseConfirmed(reply))
+            .map_err(|_| "capture task stopped".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .map_err(|_| "capture release timed out".to_owned())?
+            .map_err(|_| "capture task stopped".to_owned())?
     }
 
     pub(crate) async fn terminate(&mut self) {
@@ -164,6 +191,7 @@ macro_rules! debounce {
 }
 
 struct CaptureTask {
+    paused: bool,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
@@ -210,6 +238,9 @@ impl CaptureTask {
         loop {
             if let Err(e) = self.do_capture().await {
                 log::warn!("input capture exited: {e}");
+                self.event_tx
+                    .send(ICaptureEvent::CaptureFailed(e.to_string()))
+                    .expect("channel closed");
             }
             loop {
                 tokio::select! {
@@ -218,6 +249,8 @@ impl CaptureTask {
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
+                        CaptureRequest::ReleaseConfirmed(reply) => { let _ = reply.send(Ok(())); }
+                        CaptureRequest::SetPaused(paused, reply) => { self.paused = paused; let _ = reply.send(Ok(())); }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
@@ -237,7 +270,7 @@ impl CaptureTask {
 
         let _capture_guard = DropGuard::new(
             self.event_tx.clone(),
-            ICaptureEvent::CaptureEnabled,
+            ICaptureEvent::CaptureEnabled(capture.backend().to_string()),
             ICaptureEvent::CaptureDisabled,
         );
 
@@ -257,6 +290,9 @@ impl CaptureTask {
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        if self.paused {
+            return Ok(());
+        }
         let captures = self.captures.clone();
         for (handle, pos, _type) in captures {
             tokio::select! {
@@ -303,9 +339,19 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::ReleaseConfirmed(reply) => {
+                        let result = self.release_capture(capture).await;
+                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        result?;
+                    }
+                    CaptureRequest::SetPaused(paused, reply) => {
+                        let result = self.set_paused(capture, paused).await;
+                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        result?;
+                    }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
-                        capture.create(h, p).await?;
+                        if !self.paused { capture.create(h, p).await?; }
                     }
                     CaptureRequest::Destroy(h) => {
                         // If the capture we're tearing down is the
@@ -319,7 +365,7 @@ impl CaptureTask {
                             self.release_capture(capture).await?;
                         }
                         self.remove_capture(h);
-                        capture.destroy(h).await?;
+                        if !self.paused { capture.destroy(h).await?; }
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
@@ -337,6 +383,9 @@ impl CaptureTask {
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
+        if self.paused {
+            return capture.release().await;
+        }
         log::trace!("({handle}): {event:?}");
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
@@ -445,6 +494,26 @@ impl CaptureTask {
             }
         }
         capture.release().await
+    }
+
+    async fn set_paused(
+        &mut self,
+        capture: &mut InputCapture,
+        paused: bool,
+    ) -> Result<(), CaptureError> {
+        if self.paused == paused {
+            return Ok(());
+        }
+        self.paused = paused;
+        if paused {
+            self.release_capture(capture).await?;
+            for (handle, _, _) in self.captures.clone() {
+                capture.destroy(handle).await?;
+            }
+        } else {
+            self.create_captures(capture).await?;
+        }
+        Ok(())
     }
 }
 

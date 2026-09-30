@@ -1,10 +1,11 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -26,7 +27,7 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// fallback input emulation (logs events)
+/// Explicit test backend; also a fallback on platforms without native input.
 mod dummy;
 mod error;
 
@@ -70,9 +71,11 @@ impl Display for Backend {
 }
 
 pub struct InputEmulation {
+    backend: Backend,
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
 }
 
 impl InputEmulation {
@@ -93,10 +96,17 @@ impl InputEmulation {
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
         Ok(Self {
+            backend,
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
         })
+    }
+
+    /// The backend actually selected, including an explicit dummy fallback.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -108,6 +118,7 @@ impl InputEmulation {
             return b;
         }
 
+        let mut last_error = None;
         for backend in [
             #[cfg(wlroots)]
             Backend::Wlroots,
@@ -121,6 +132,8 @@ impl InputEmulation {
             Backend::Windows,
             #[cfg(target_os = "macos")]
             Backend::MacOs,
+            // Native permission failures must remain visible to the frontend.
+            #[cfg(not(any(target_os = "macos", windows)))]
             Backend::Dummy,
         ] {
             match Self::with_backend(backend).await {
@@ -129,11 +142,14 @@ impl InputEmulation {
                     return Ok(b);
                 }
                 Err(e) if e.cancelled_by_user() => return Err(e),
-                Err(e) => log::warn!("{e}"),
+                Err(e) => {
+                    log::warn!("{backend} input emulation backend unavailable: {e}");
+                    last_error = Some(e);
+                }
             }
         }
 
-        Err(EmulationCreationError::NoAvailableBackend)
+        Err(last_error.unwrap_or(EmulationCreationError::NoAvailableBackend))
     }
 
     pub async fn consume(
@@ -149,6 +165,20 @@ impl InputEmulation {
                 }
                 Ok(())
             }
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => {
+                let Some(buttons) = self.pressed_buttons.get_mut(&handle) else {
+                    return Ok(());
+                };
+                let changed = if state == 0 {
+                    buttons.remove(&button)
+                } else {
+                    buttons.insert(button)
+                };
+                if changed {
+                    self.emulation.consume(event, handle).await?;
+                }
+                Ok(())
+            }
             _ => self.emulation.consume(event, handle).await,
         }
     }
@@ -156,6 +186,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -167,6 +198,7 @@ impl InputEmulation {
         let _ = self.release_keys(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.emulation.destroy(handle).await
         }
     }
@@ -194,6 +226,20 @@ impl InputEmulation {
             }
         }
 
+        if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+            for button in buttons.drain().collect::<Vec<_>>() {
+                self.emulation
+                    .consume(
+                        Event::Pointer(PointerEvent::Button {
+                            time: 0,
+                            button,
+                            state: 0,
+                        }),
+                        handle,
+                    )
+                    .await?;
+            }
+        }
         let event = Event::Keyboard(KeyboardEvent::Modifiers {
             depressed: 0,
             latched: 0,
@@ -237,4 +283,124 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, PartialEq)]
+    enum Recorded {
+        Input(EmulationHandle, Event),
+        Destroy(EmulationHandle),
+        Terminate,
+    }
+
+    struct RecordingEmulation(Arc<Mutex<Vec<Recorded>>>);
+
+    #[async_trait]
+    impl Emulation for RecordingEmulation {
+        async fn consume(
+            &mut self,
+            event: Event,
+            handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            self.0.lock().unwrap().push(Recorded::Input(handle, event));
+            Ok(())
+        }
+
+        async fn create(&mut self, _: EmulationHandle) {}
+
+        async fn destroy(&mut self, handle: EmulationHandle) {
+            self.0.lock().unwrap().push(Recorded::Destroy(handle));
+        }
+
+        async fn terminate(&mut self) {
+            self.0.lock().unwrap().push(Recorded::Terminate);
+        }
+    }
+
+    fn key_event(key: u32, state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state,
+        })
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[tokio::test]
+    async fn automatic_native_selection_does_not_hide_failure_with_dummy() {
+        // Native constructors only preflight permissions; no input is replayed.
+        match InputEmulation::new(None).await {
+            Ok(mut emulation) => {
+                assert_ne!(emulation.backend(), Backend::Dummy);
+                emulation.terminate().await;
+            }
+            #[cfg(target_os = "macos")]
+            Err(EmulationCreationError::MacOs(_)) => {}
+            #[cfg(windows)]
+            Err(EmulationCreationError::Windows(_)) => {}
+            Err(error) => panic!("native backend error was lost: {error}"),
+        }
+        let mut dummy = InputEmulation::new(Some(Backend::Dummy)).await.unwrap();
+        assert_eq!(dummy.backend(), Backend::Dummy);
+        dummy.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_termination_release_keys_before_destroying_handles() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = InputEmulation {
+            backend: Backend::Dummy,
+            emulation: Box::new(RecordingEmulation(recorded.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        };
+        let ctrl = input_event::scancode::Linux::KeyLeftCtrl as u32;
+        let shift = input_event::scancode::Linux::KeyLeftShift as u32;
+        emulation.create(1).await;
+        emulation.create(2).await;
+        emulation.consume(key_event(ctrl, 1), 1).await.unwrap();
+        let mouse = |state| {
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: input_event::BTN_LEFT,
+                state,
+            })
+        };
+        emulation.consume(mouse(1), 1).await.unwrap();
+        emulation.consume(key_event(shift, 1), 2).await.unwrap();
+        recorded.lock().unwrap().clear();
+
+        // One disconnect must release only that client's keys.
+        emulation.destroy(1).await;
+        assert!(!emulation.has_pressed_keys(1));
+        assert!(emulation.has_pressed_keys(2));
+        emulation.terminate().await;
+        assert!(!emulation.has_pressed_keys(2));
+        assert!(emulation.handles.is_empty());
+
+        let reset_modifiers = Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+        });
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec![
+                Recorded::Input(1, key_event(ctrl, 0)),
+                Recorded::Input(1, mouse(0)),
+                Recorded::Input(1, reset_modifiers),
+                Recorded::Destroy(1),
+                Recorded::Input(2, key_event(shift, 0)),
+                Recorded::Input(2, reset_modifiers),
+                Recorded::Destroy(2),
+                Recorded::Terminate,
+            ]
+        );
+    }
 }

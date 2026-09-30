@@ -1,3 +1,4 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 mod authorization_window;
 mod client_object;
 mod client_row;
@@ -289,6 +290,7 @@ fn build_ui(app: &Application) {
             loop {
                 let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
                 match notify {
+                    FrontendEvent::UiResult { .. } => {}
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)
                     }

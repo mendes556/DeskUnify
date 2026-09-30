@@ -1,48 +1,49 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 use crate::config::Config;
 use clap::Args;
 use futures::StreamExt;
-use input_capture::{self, CaptureError, CaptureEvent, InputCapture, InputCaptureError, Position};
-use input_event::{Event, KeyboardEvent};
+use input_capture::{CaptureError, CaptureEvent, InputCapture, InputCaptureError, Position};
+use input_event::{Event, KeyboardEvent, scancode::Linux};
+use std::time::Duration;
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
-pub struct TestCaptureArgs {}
-
-pub async fn run(config: Config, _args: TestCaptureArgs) -> Result<(), InputCaptureError> {
-    log::info!("running input capture test");
-    log::info!("creating input capture");
-    let backend = config.capture_backend().map(|b| b.into());
-    loop {
-        let mut input_capture = InputCapture::new(backend).await?;
-        log::info!("creating clients");
-        input_capture.create(0, Position::Left).await?;
-        input_capture.create(4, Position::Left).await?;
-        input_capture.create(1, Position::Right).await?;
-        input_capture.create(2, Position::Top).await?;
-        input_capture.create(3, Position::Bottom).await?;
-        if let Err(e) = do_capture(&mut input_capture).await {
-            log::warn!("{e} - recreating capture");
-        }
-        let _ = input_capture.terminate().await;
-    }
+pub struct TestCaptureArgs {
+    #[arg(long, default_value_t=15, value_parser=clap::value_parser!(u64).range(1..=300))]
+    seconds: u64,
 }
 
-async fn do_capture(input_capture: &mut InputCapture) -> Result<(), CaptureError> {
-    loop {
-        let (client, event) = input_capture
-            .next()
-            .await
-            .ok_or(CaptureError::EndOfStream)??;
-        let pos = match client {
-            0 | 4 => Position::Left,
-            1 => Position::Right,
-            2 => Position::Top,
-            3 => Position::Bottom,
-            _ => panic!(),
-        };
-        log::info!("position: {client} ({pos}), event: {event}");
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key: 1, .. })) = event {
-            input_capture.release().await?;
-            break Ok(());
+pub async fn run(config: Config, args: TestCaptureArgs) -> Result<(), InputCaptureError> {
+    let backend = config.capture_backend().map(|b| b.into());
+    let mut capture = InputCapture::new(backend).await?;
+    log::info!(
+        "testing {} capture for {} seconds; Escape or Ctrl+C exits",
+        capture.backend(),
+        args.seconds
+    );
+    let result = async {
+        for (id, position) in [Position::Left, Position::Right, Position::Top, Position::Bottom].into_iter().enumerate() {
+            capture.create(id as u64, position).await?;
         }
-    }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(args.seconds);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                result = tokio::signal::ctrl_c() => { result.map_err(CaptureError::Io)?; break; }
+                event = capture.next() => {
+                    let (client, event) = event.ok_or(CaptureError::EndOfStream)??;
+                    log::info!("capture {client}: {event}");
+                    if matches!(event, CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state: 1, .. })) if key == Linux::KeyEsc as u32) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok::<(), CaptureError>(())
+    }.await;
+    let released = capture.release().await;
+    let terminated = capture.terminate().await;
+    result?;
+    released?;
+    terminated?;
+    Ok(())
 }

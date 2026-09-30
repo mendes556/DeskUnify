@@ -1,3 +1,4 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
@@ -117,6 +118,7 @@ impl Display for Backend {
 }
 
 pub struct InputCapture {
+    backend: Backend,
     /// capture backend
     capture: Box<dyn Capture>,
     /// keys pressed by active capture
@@ -191,14 +193,20 @@ impl InputCapture {
 
     /// creates a new [`InputCapture`]
     pub async fn new(backend: Option<Backend>) -> Result<Self, CaptureCreationError> {
-        let capture = create(backend).await?;
+        let (capture, backend) = create(backend).await?;
         Ok(Self {
+            backend,
             capture,
             id_map: Default::default(),
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
         })
+    }
+
+    /// The backend actually selected for capture.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// check whether the given keys are pressed
@@ -315,7 +323,10 @@ async fn create_backend(
 async fn create(
     backend: Option<Backend>,
 ) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    (
+        Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+        Backend,
+    ),
     CaptureCreationError,
 > {
     if let Some(backend) = backend {
@@ -323,9 +334,10 @@ async fn create(
         if b.is_ok() {
             log::info!("using capture backend: {backend}");
         }
-        return b;
+        return b.map(|capture| (capture, backend));
     }
 
+    let mut last_error = None;
     for backend in [
         #[cfg(libei)]
         Backend::InputCapturePortal,
@@ -341,11 +353,14 @@ async fn create(
         match create_backend(backend).await {
             Ok(b) => {
                 log::info!("using capture backend: {backend}");
-                return Ok(b);
+                return Ok((b, backend));
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
-            Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
+            Err(e) => {
+                log::warn!("{backend} input capture backend unavailable: {e}");
+                last_error = Some(e);
+            }
         }
     }
-    Err(CaptureCreationError::NoAvailableBackend)
+    Err(last_error.unwrap_or(CaptureCreationError::NoAvailableBackend))
 }

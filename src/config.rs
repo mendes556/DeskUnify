@@ -1,3 +1,4 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 use crate::capture_test::TestCaptureArgs;
 use crate::emulation_test::TestEmulationArgs;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -62,6 +63,8 @@ fn default_path() -> Result<PathBuf, VarError> {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct ConfigToml {
+    clipboard: Option<bool>,
+    discovery: Option<bool>,
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
@@ -120,6 +123,9 @@ struct Args {
 
 #[derive(Subcommand, Clone, Debug, Eq, PartialEq)]
 pub enum Command {
+    /// Encrypted file transfer, independent of input permissions and daemon
+    #[cfg(any(target_os = "macos", windows))]
+    Files(crate::files::FileArgs),
     /// test input emulation
     TestEmulation(TestEmulationArgs),
     /// test input capture
@@ -436,6 +442,13 @@ impl Config {
         }
     }
 
+    pub fn discovery_enabled(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.discovery)
+            .unwrap_or(true)
+    }
+
     /// the command to run
     pub fn command(&self) -> Option<Command> {
         self.args.command.clone()
@@ -480,6 +493,21 @@ impl Config {
             .unwrap_or(DEFAULT_PORT)
     }
 
+    /// Enable text clipboard synchronization on Windows/macOS.
+    pub fn clipboard_enabled(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.clipboard)
+            .unwrap_or(false)
+    }
+
+    pub fn set_ui_settings(&mut self, port: u16, clipboard: bool) {
+        self.args.port = None;
+        let config = self.config_toml.get_or_insert_with(Default::default);
+        config.port = Some(port);
+        config.clipboard = Some(clipboard);
+    }
+
     /// list of configured clients
     pub fn clients(&self) -> Vec<ConfigClient> {
         self.config_toml
@@ -502,9 +530,6 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }

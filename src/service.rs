@@ -1,3 +1,6 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
+#[cfg(any(target_os = "macos", windows))]
+use crate::clipboard::{ClipboardSync, Settings as ClipboardSettings};
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
@@ -22,6 +25,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
+mod ui;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -36,6 +40,10 @@ pub enum ServiceError {
 }
 
 pub struct Service {
+    ui: ui::UiState,
+    discovery: crate::discovery::Discovery,
+    #[cfg(any(target_os = "macos", windows))]
+    clipboard: ClipboardSync,
     /// configuration
     config: Config,
     /// input capture
@@ -95,6 +103,8 @@ impl Service {
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        #[cfg(any(target_os = "macos", windows))]
+        let clipboard = ClipboardSync::new(cert.clone(), authorized_keys.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -107,6 +117,10 @@ impl Service {
 
         let port = config.port();
         let service = Self {
+            ui: Default::default(),
+            discovery: crate::discovery::Discovery::new(public_key_fingerprint.clone()),
+            #[cfg(any(target_os = "macos", windows))]
+            clipboard,
             config,
             capture,
             emulation,
@@ -141,8 +155,12 @@ impl Service {
         }
 
         loop {
+            self.discovery
+                .configure(self.config.discovery_enabled(), self.port);
+            #[cfg(any(target_os = "macos", windows))]
+            self.configure_clipboard();
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
@@ -150,25 +168,60 @@ impl Service {
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
+            if self.ui.shutdown {
+                self.handle_frontend_pending().await;
+                break;
+            }
         }
 
         log::info!("terminating service ...");
+        self.discovery.stop();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        #[cfg(any(target_os = "macos", windows))]
+        self.clipboard.terminate().await;
 
         Ok(())
     }
 
-    fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
+    #[cfg(any(target_os = "macos", windows))]
+    fn configure_clipboard(&self) {
+        let peers = self
+            .client_manager
+            .clients()
+            .into_iter()
+            .filter(|(_, state)| state.active)
+            .flat_map(|(config, state)| {
+                state
+                    .ips
+                    .into_iter()
+                    .map(move |ip| SocketAddr::new(ip, config.port))
+            })
+            .collect();
+        self.clipboard.configure(ClipboardSettings {
+            enabled: self.config.clipboard_enabled() && !self.ui.paused,
+            port: self.port,
+            peers,
+        });
+    }
+
+    async fn handle_frontend_request(
+        &mut self,
+        request: Option<Result<FrontendRequest, IpcError>>,
+    ) {
         let request = match request.expect("frontend listener closed") {
             Ok(r) => r,
             Err(e) => return log::error!("error receiving request: {e}"),
         };
         match request {
+            FrontendRequest::Ui { id, action } => {
+                let result = self.handle_ui_action(action).await;
+                self.notify_frontend(FrontendEvent::UiResult { id, result });
+            }
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
                 self.save_config();
@@ -222,6 +275,12 @@ impl Service {
     }
 
     fn save_config(&mut self) {
+        if let Err(e) = self.persist_config() {
+            log::warn!("failed to write config: {e}");
+        }
+    }
+
+    fn persist_config(&mut self) -> Result<(), io::Error> {
         let clients = self.client_manager.clients();
         let clients = clients
             .into_iter()
@@ -238,9 +297,7 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
-        if let Err(e) = self.config.write_back() {
-            log::warn!("failed to write config: {e}");
-        }
+        self.config.write_back()
     }
 
     fn handle_config_change(&mut self) {
@@ -276,6 +333,10 @@ impl Service {
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
+                if !self.ui.attempts.contains(&fingerprint) {
+                    self.ui.attempts.push_front(fingerprint.clone());
+                    self.ui.attempts.truncate(16);
+                }
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
             EmulationEvent::Entered {
@@ -309,10 +370,16 @@ impl Service {
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
             EmulationEvent::EmulationDisabled => {
+                self.ui.emulation_backend = None;
                 self.emulation_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::EmulationEnabled => {
+            EmulationEvent::EmulationFailed(error) => {
+                self.ui.emulation_error = Some(error);
+            }
+            EmulationEvent::EmulationEnabled(backend) => {
+                self.ui.emulation_backend = Some(backend);
+                self.ui.emulation_error = None;
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
@@ -344,18 +411,30 @@ impl Service {
                 }
             }
             ICaptureEvent::CaptureDisabled => {
+                self.ui.capture_backend = None;
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
-            ICaptureEvent::CaptureEnabled => {
+            ICaptureEvent::CaptureFailed(error) => {
+                self.ui.capture_error = Some(error);
+            }
+            ICaptureEvent::CaptureEnabled(backend) => {
+                self.ui.capture_backend = Some(backend);
+                self.ui.capture_error = None;
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {
+                if !self.ui.paused {
+                    self.ui.active_client = Some(handle);
+                }
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
             ICaptureEvent::ClientLeft(handle) => {
+                if self.ui.active_client == Some(handle) {
+                    self.ui.active_client = None;
+                }
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
@@ -463,6 +542,7 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
+        self.ui.attempts.retain(|attempt| attempt != &fp);
         self.authorized_keys.write().expect("lock").insert(fp, desc);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
@@ -569,7 +649,11 @@ impl Service {
 
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
         // update state in event input emulator & input capture
-        if self.client_manager.set_pos(handle, pos) {
+        let active = self
+            .client_manager
+            .get_state(handle)
+            .is_some_and(|(_, state)| state.active);
+        if self.client_manager.set_pos(handle, pos) && active {
             self.deactivate_client(handle);
             self.activate_client(handle);
         }

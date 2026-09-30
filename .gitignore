@@ -12,3 +12,15 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+
+# Local editor, Python and credential artifacts (not part of source releases)
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+PROJECT.local.md

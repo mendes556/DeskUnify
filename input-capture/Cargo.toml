@@ -1,10 +1,11 @@
+# DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 [package]
 name = "input-capture"
 description = "cross-platform input-capture library used by lan-mouse"
 version = "0.4.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/mendes556/DeskUnify"
 
 [dependencies]
 futures = "0.3.28"

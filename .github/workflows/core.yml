@@ -1,0 +1,54 @@
+name: DeskUnify Core
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: core-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Build without GTK
+        run: cargo build -p lan-mouse --no-default-features --locked
+      - name: Test core workspace
+        run: cargo test --workspace --exclude lan-mouse-gtk --exclude lan-mouse-egui --no-default-features --locked
+      - name: Lint core workspace
+        run: cargo clippy --workspace --exclude lan-mouse-gtk --exclude lan-mouse-egui --no-default-features --all-targets --locked -- -D warnings
+      - name: Test CLI discovery and keyboard/mouse transport
+        if: runner.os == 'macOS'
+        run: python3 scripts/test-cli.py target/debug/lan-mouse
+      - name: Build native egui UI
+        run: cargo build -p lan-mouse --no-default-features --features egui --locked
+      - name: Lint desktop UI
+        run: cargo clippy -p lan-mouse -p lan-mouse-egui --no-default-features --features egui --all-targets --locked -- -D warnings
+      - name: Test UI model
+        run: cargo test -p lan-mouse-egui --locked
+      - name: Test desktop IPC lifecycle
+        if: runner.os == 'macOS'
+        run: python3 scripts/test-desktop.py target/debug/lan-mouse
+      - name: Test file transfer and resume
+        if: runner.os == 'macOS'
+        run: python3 scripts/test-files.py target/debug/lan-mouse
+      - name: Check CLI pairing command
+        run: cargo run -p lan-mouse --no-default-features --locked -- cli fingerprint --help

@@ -1,3 +1,4 @@
+// DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 use std::{
     collections::{HashMap, HashSet},
     env::VarError,
@@ -57,6 +58,8 @@ pub enum IpcError {
 }
 
 pub const DEFAULT_PORT: u16 = 4242;
+/// Local IPC schema version. UI and daemon must use matching builds.
+pub const IPC_VERSION: u32 = 6;
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -189,6 +192,11 @@ pub struct ClientState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    /// A correlated desktop UI operation, confirmed by the daemon.
+    UiResult {
+        id: String,
+        result: Result<UiSnapshot, String>,
+    },
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -230,6 +238,10 @@ pub enum FrontendEvent {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    Ui {
+        id: String,
+        action: UiAction,
+    },
     /// activate/deactivate client
     Activate(ClientHandle, bool),
     /// add a new client
@@ -268,6 +280,135 @@ pub enum FrontendRequest {
     SaveConfiguration,
 }
 
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiAction {
+    Snapshot,
+    AddClient {
+        hostname: Option<String>,
+        ips: Vec<IpAddr>,
+        port: u16,
+        position: Position,
+        fingerprint: Option<String>,
+        #[serde(default)]
+        enter_hook: Option<String>,
+        #[serde(default)]
+        leave_hook: Option<String>,
+    },
+    UpdateClient {
+        id: ClientHandle,
+        hostname: Option<String>,
+        ips: Vec<IpAddr>,
+        port: u16,
+        position: Position,
+        active: bool,
+    },
+    RemoveClient {
+        id: ClientHandle,
+    },
+    SetHostname {
+        id: ClientHandle,
+        hostname: Option<String>,
+    },
+    SetClientPort {
+        id: ClientHandle,
+        port: u16,
+    },
+    SetClientIps {
+        id: ClientHandle,
+        ips: Vec<IpAddr>,
+    },
+    SetPosition {
+        id: ClientHandle,
+        position: Position,
+    },
+    SetActive {
+        id: ClientHandle,
+        active: bool,
+    },
+    Authorize {
+        description: String,
+        fingerprint: String,
+    },
+    Revoke {
+        fingerprint: String,
+    },
+    SetSettings {
+        port: u16,
+        clipboard: bool,
+    },
+    SetPaused {
+        paused: bool,
+    },
+    Release,
+    RetryBackends,
+    SetHooks {
+        id: ClientHandle,
+        enter_hook: Option<String>,
+        leave_hook: Option<String>,
+    },
+    SaveConfig,
+    Scan,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredDevice {
+    pub name: String,
+    pub ips: Vec<IpAddr>,
+    pub port: u16,
+    pub fingerprint: String,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiSnapshot {
+    pub protocol_version: u32,
+    pub clients: Vec<(ClientHandle, ClientConfig, ClientState)>,
+    pub fingerprint: String,
+    pub authorized: HashMap<String, String>,
+    pub port: u16,
+    pub clipboard: bool,
+    pub clipboard_supported: bool,
+    pub paused: bool,
+    pub active_client: Option<ClientHandle>,
+    pub capture: Status,
+    pub capture_backend: Option<String>,
+    pub emulation_backend: Option<String>,
+    pub capture_error: Option<String>,
+    pub emulation_error: Option<String>,
+    pub emulation: Status,
+    pub release_bind: Vec<String>,
+    pub platform: String,
+    pub config_path: String,
+    pub connection_attempts: Vec<String>,
+    pub discovered: Vec<DiscoveredDevice>,
+    pub discovery_error: Option<String>,
+}
+
+/// A virtual or unidentified backend cannot share physical input.
+pub fn native_backend_ready(status: Status, backend: Option<&str>) -> bool {
+    status == Status::Enabled && backend.is_some_and(|name| name != "dummy")
+}
+
+impl UiSnapshot {
+    pub fn native_ready(&self) -> bool {
+        native_backend_ready(self.capture, self.capture_backend.as_deref())
+            && native_backend_ready(self.emulation, self.emulation_backend.as_deref())
+    }
+
+    /// Connection readiness still requires a physical cross-screen test.
+    pub fn doctor_ready(&self, local: bool) -> bool {
+        self.native_ready()
+            && !self.paused
+            && (local
+                || self
+                    .clients
+                    .iter()
+                    .any(|(_, _, state)| state.active && state.alive))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Status {
     #[default]
@@ -297,6 +438,9 @@ pub enum SocketPathError {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
+    if let Some(path) = env::var_os("LAN_MOUSE_IPC_SOCKET") {
+        return Ok(PathBuf::from(path));
+    }
     let xdg_runtime_dir =
         env::var("XDG_RUNTIME_DIR").map_err(SocketPathError::XdgRuntimeDirNotFound)?;
     Ok(Path::new(xdg_runtime_dir.as_str()).join(LAN_MOUSE_SOCKET_NAME))
@@ -304,6 +448,9 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
 
 #[cfg(all(unix, target_os = "macos"))]
 pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
+    if let Some(path) = env::var_os("LAN_MOUSE_IPC_SOCKET") {
+        return Ok(PathBuf::from(path));
+    }
     let home = env::var("HOME").map_err(SocketPathError::HomeDirNotFound)?;
     Ok(Path::new(home.as_str())
         .join("Library")

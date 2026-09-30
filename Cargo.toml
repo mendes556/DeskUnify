@@ -1,3 +1,4 @@
+# DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 [workspace]
 members = [
     "input-capture",
@@ -7,15 +8,16 @@ members = [
     "lan-mouse-cli",
     "lan-mouse-gtk",
     "lan-mouse-proto",
+    "lan-mouse-egui",
 ]
 
 [package]
 name = "lan-mouse"
-description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
+description = "DeskUnify: keyboard, mouse, clipboard and file sharing across local computers"
 version = "0.11.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/mendes556/DeskUnify"
 
 [profile.release]
 codegen-units = 1
@@ -32,7 +34,8 @@ input-emulation = { path = "input-emulation", version = "0.4.0", default-feature
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
-lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
+lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.6.0" }
+lan-mouse-egui = { path = "lan-mouse-egui", version = "0.1.0", optional = true }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
@@ -45,6 +48,7 @@ serde_json = "1.0.107"
 tokio = { version = "1.32.0", features = [
     "io-util",
     "io-std",
+    "fs",
     "macros",
     "net",
     "process",
@@ -67,13 +71,27 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+mdns-sd = "0.21"
+hostname = "0.4"
+tempfile = "3.25"
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+arboard = { version = "3.6", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
 
 [features]
 default = [
-    "gtk",
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
@@ -83,6 +101,7 @@ default = [
     "x11_emulation",
 ]
 gtk = ["dep:lan-mouse-gtk"]
+egui = ["dep:lan-mouse-egui"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -92,7 +111,7 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
-name = "Lan Mouse"
+name = "DeskUnify"
 icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
 identifier = "de.feschber.LanMouse"
 deb_depends = [ "libadwaita-1-0" ]
@@ -100,4 +119,3 @@ resources = ["target/menubar-template.png"]
 
 [package.metadata.bundle.osx]
 info_plist_exts = ["build-aux/macos-lsui-element.plist"]
-
