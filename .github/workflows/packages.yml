@@ -1,0 +1,65 @@
+name: DeskUnify Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+            binary: lan-mouse
+          - os: macos-15-intel
+            platform: macos-x86_64
+            target: x86_64-apple-darwin
+            binary: lan-mouse
+          - os: windows-latest
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            binary: lan-mouse.exe
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages-${{ matrix.target }}
+      - name: Build release GUI and CLI
+        run: cargo build --release -p lan-mouse --no-default-features --features egui --target ${{ matrix.target }} --locked
+      - name: Verify CLI entry points
+        shell: bash
+        run: |
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+          target/${{ matrix.target }}/release/${{ matrix.binary }} cli fingerprint --help
+          target/${{ matrix.target }}/release/${{ matrix.binary }} files sync --help
+      - name: Verify desktop IPC
+        if: runner.os == 'macOS'
+        run: python scripts/test-desktop.py target/${{ matrix.target }}/release/${{ matrix.binary }}
+      - name: Verify file integrity and resume
+        if: runner.os == 'macOS'
+        run: python scripts/test-files.py target/${{ matrix.target }}/release/${{ matrix.binary }}
+      - name: Package application and documentation
+        run: python scripts/package-release.py target/${{ matrix.target }}/release/${{ matrix.binary }} --platform ${{ matrix.platform }}
+      - name: Upload ZIP and SHA-256
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskUnify-${{ matrix.platform }}
+          path: |
+            target/packages/*.zip
+            target/packages/*.sha256
+          if-no-files-found: error
+          retention-days: 30

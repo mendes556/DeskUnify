@@ -7,6 +7,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tomllib
 
 if sys.platform!='darwin':
     raise SystemExit('macOS packaging only; Windows runs target/release/lan-mouse.exe')
@@ -22,13 +23,14 @@ app=Path(args.output).resolve()
 if app.suffix != '.app':
     raise SystemExit('Output must be a .app bundle')
 contents=app/'Contents'
+version=tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
 (contents/'MacOS').mkdir(parents=True,exist_ok=True)
 (contents/'Resources').mkdir(parents=True,exist_ok=True)
 shutil.copy2(binary,contents/'MacOS'/'lan-mouse')
 shutil.copy2('lan-mouse-egui/icons/icon.icns',contents/'Resources'/'icon.icns')
 shutil.copy2('LICENSE',contents/'Resources'/'LICENSE')
 with (contents/'Info.plist').open('wb') as output:
-    plistlib.dump({'CFBundleIconFile':'icon.icns','CFBundleExecutable':'lan-mouse','CFBundleIdentifier':'dev.lanbridge.desktop','CFBundleName':'DeskUnify','CFBundleDisplayName':'DeskUnify','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.1.0','CFBundleVersion':'1','NSHighResolutionCapable':True,'NSLocalNetworkUsageDescription':'Discover and connect to DeskUnify computers on your local network.','NSBonjourServices':['_lanbridge._udp'],'NSInputMonitoringUsageDescription':'Share keyboard and mouse input with authorized devices on your local network.','NSAccessibilityUsageDescription':'Capture and replay keyboard and mouse input for local network sharing.'},output)
+    plistlib.dump({'CFBundleIconFile':'icon.icns','CFBundleExecutable':'lan-mouse','CFBundleIdentifier':'dev.lanbridge.desktop','CFBundleName':'DeskUnify','CFBundleDisplayName':'DeskUnify','CFBundlePackageType':'APPL','CFBundleShortVersionString':version,'CFBundleVersion':'1','NSHighResolutionCapable':True,'NSLocalNetworkUsageDescription':'Discover and connect to DeskUnify computers on your local network.','NSBonjourServices':['_lanbridge._udp'],'NSInputMonitoringUsageDescription':'Share keyboard and mouse input with authorized devices on your local network.','NSAccessibilityUsageDescription':'Capture and replay keyboard and mouse input for local network sharing.'},output)
 subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
 print(app)
 if args.archive:

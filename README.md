@@ -21,7 +21,7 @@ DeskUnify is an early development fork of [Lan Mouse](https://github.com/feschbe
 
 ## Status
 
-**Alpha / development software.** Source builds are available; no official signed or notarized installer has been published.
+**Alpha / development software.** Source builds and portable packaging are available; no official signed or notarized installer has been published.
 
 - Apple Silicon and Intel macOS builds have been verified. macOS-to-macOS connections and bidirectional file transfers have been exercised on real devices.
 - Windows code has passed a GNU cross-compilation check. Windows hardware, Windows-to-Windows and Windows-to-macOS interaction still need validation.
@@ -43,6 +43,20 @@ cargo build --release -p lan-mouse --no-default-features --locked
 ```
 
 On Windows, use `./target/release/lan-mouse.exe`. The Rust crate and executable names remain `lan-mouse` for compatibility; the application name is DeskUnify.
+
+### Portable desktop packages
+
+The manually triggered [DeskUnify Packages workflow](https://github.com/mendes556/DeskUnify/actions/workflows/packages.yml) builds macOS ARM64, macOS Intel x86_64 and Windows x86_64 packages on native runners. Each artifact contains an application ZIP and its SHA-256 checksum; downloads are retained for 30 days. The ZIP includes the GUI/CLI, license, usage documentation and source commit metadata. macOS apps use ad-hoc signing without notarization; Windows executables are unsigned and built with the static MSVC runtime.
+
+To package a native release build locally, use Python 3.11 or newer:
+
+```sh
+python3 scripts/package-release.py target/release/lan-mouse --platform macos-arm64
+# Intel Mac: --platform macos-x86_64
+# Windows: python scripts/package-release.py target/x86_64-pc-windows-msvc/release/lan-mouse.exe --platform windows-x86_64
+```
+
+On Windows, build with `--target x86_64-pc-windows-msvc` and `RUSTFLAGS="-C target-feature=+crt-static"`, as in the workflow. Outputs go to `target/packages/`. Download and extract the matching platform ZIP; on macOS move DeskUnify.app to Applications, and on Windows run DeskUnify.exe from the extracted folder. Exit an old instance before updating; existing pairing/configuration is retained.
 
 In another terminal:
 

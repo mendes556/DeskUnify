@@ -227,7 +227,7 @@ cargo test --workspace --exclude lan-mouse-gtk --no-default-features --locked
 cargo clippy --workspace --exclude lan-mouse-gtk --no-default-features --all-targets --locked -- -D warnings
 ```
 
-`.github/workflows/core.yml` 在 Windows、Apple Silicon macOS、Intel macOS 上执行上述核心检查及构建。完整 GTK 检查仍使用现有 `.github/workflows/rust.yml`，需要 GTK/libadwaita 开发依赖。
+`.github/workflows/core.yml` 在 Windows、Apple Silicon macOS、Intel macOS 上执行上述核心检查及构建。完整 GTK 检查需要 GTK/libadwaita 开发依赖；原上游工作流已归档到 `docs/upstream/rust.yml`。
 
 ---
 
@@ -487,7 +487,9 @@ python3 scripts/test-files.py target/release/lan-mouse
 
 2026-10-01 双机 release 验收：Apple Silicon Mac 与 Intel Mac通过现有 Wi-Fi 传送 128 MiB 文件，分别为 20.94 / 21.38 MiB/s，对应加密通道测速为 21.90 / 22.52 MiB/s；1001 个小文件（约 3.88 MiB）传输、校验与落盘用了 0.391 秒，另在接收端逐文件核对 SHA-256。中断续传及完整批次零数据重传通过。这些是本次链路实测值，其他网络、磁盘与文件组合需要重新测速。
 
-本地程序可从源码运行。macOS GUI 包由 `scripts/package-desktop.py` 生成，CLI 包由 `scripts/package-cli.py` 生成；打包输出不包含配置、证书或私钥。本项目的首发准备以源码为主，尚未提供正式签名、公证或已发布的下载包。GUI 的「开启自动复制粘贴」与手动接收不能同时占用默认端口。
+本地程序可从源码运行。macOS GUI 包由 `scripts/package-desktop.py` 生成，CLI 包由 `scripts/package-cli.py` 生成；打包输出不包含配置、证书或私钥。GUI 的「开启自动复制粘贴」与手动接收不能同时占用默认端口。
+
+三平台便携包使用 `scripts/package-release.py`（Python 3.11+），通过 GitHub Actions 的 DeskUnify Packages 手动工作流分别在原生 macOS ARM64、Intel macOS 和 Windows x86_64 环境编译。包包含 GUI 与 CLI、使用说明、GPL 许可证、源码提交信息和 ZIP 的 SHA-256 校验文件。Actions 产物保留 30 天，不自动发布 Release。macOS 为临时签名、无 Apple 公证；Windows 为未签名的静态 MSVC 运行库程序。完整解压后运行，Mac 可先将 DeskUnify.app 放到「应用程序」。更新前退出旧实例，保留原有配对和配置。
 
 从仓库启动新 GUI：
 
