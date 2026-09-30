@@ -70,6 +70,17 @@ with tempfile.TemporaryDirectory(prefix="lan-bridge-files-") as directory:
             assert line, sender.stderr.read()
             event = json.loads(line)
             if event.get("event") == "progress" and event["network_bytes"] >= 1048576: break
+        # Sender progress can precede the receiver's TLS read/disk write. Wait
+        # for complete chunks on the receiving side before interrupting.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            partial = list(output.glob(".lan-bridge-*.partial/fixtures/large.bin"))
+            if partial and partial[0].stat().st_size >= 2 * 1048576:
+                break
+            assert sender.poll() is None, "sender exited before interruption"
+            time.sleep(.025)
+        else:
+            raise AssertionError("receiver did not persist complete chunks before interruption")
         sender.send_signal(signal.SIGINT)
         sender.communicate(timeout=5)
         assert sender.returncode != 0

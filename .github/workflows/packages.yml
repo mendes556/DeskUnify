@@ -38,6 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: packages-${{ matrix.target }}
+          cache-on-failure: true
       - name: Build release GUI and CLI
         run: cargo build --release -p lan-mouse --no-default-features --features egui --target ${{ matrix.target }} --locked
       - name: Verify CLI entry points
