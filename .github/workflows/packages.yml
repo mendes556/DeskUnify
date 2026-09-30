@@ -54,13 +54,13 @@ jobs:
         if: runner.os == 'macOS'
         run: python scripts/test-files.py target/${{ matrix.target }}/release/${{ matrix.binary }}
       - name: Package application and documentation
-        run: python scripts/package-release.py target/${{ matrix.target }}/release/${{ matrix.binary }} --platform ${{ matrix.platform }}
+        run: python scripts/package-release.py target/${{ matrix.target }}/release/${{ matrix.binary }} --platform ${{ matrix.platform }} --output-dir "${{ runner.temp }}/deskunify-packages"
       - name: Upload ZIP and SHA-256
         uses: actions/upload-artifact@v4
         with:
           name: DeskUnify-${{ matrix.platform }}
           path: |
-            target/packages/*.zip
-            target/packages/*.sha256
+            ${{ runner.temp }}/deskunify-packages/*.zip
+            ${{ runner.temp }}/deskunify-packages/*.sha256
           if-no-files-found: error
           retention-days: 30
