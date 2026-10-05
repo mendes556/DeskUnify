@@ -5,6 +5,8 @@ mod transport;
 use eframe::egui;
 use thiserror::Error;
 
+pub(crate) const APP_ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
+
 #[derive(Debug, Error)]
 pub enum EguiError {
     #[error("desktop UI: {0}")]
@@ -19,7 +21,7 @@ pub fn run(owns_daemon: bool) -> Result<(), EguiError> {
         .with_app_id("dev.lanbridge.desktop")
         .with_inner_size([1160.0, 800.0])
         .with_min_inner_size([860.0, 660.0]);
-    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../icons/icon.png")) {
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions {
