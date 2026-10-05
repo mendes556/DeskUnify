@@ -3,6 +3,10 @@ use std::fmt::{self, Display};
 pub mod error;
 pub mod scancode;
 
+/// Native macOS events replayed by DeskUnify must never be forwarded again.
+/// Stored in CGEvent's user-data field; this is not part of the wire protocol.
+pub const MACOS_EMULATED_EVENT_TAG: i64 = 0x4465_736b_556e_6966;
+
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 

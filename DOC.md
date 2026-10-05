@@ -392,6 +392,8 @@ cargo clippy -p lan-mouse -p lan-mouse-egui --no-default-features --features egu
 cargo test -p lan-mouse --no-default-features discovery -- --include-ignored
 ```
 
+macOS 模拟输入带有本程序的原生事件标记，采集器不会把这些键鼠事件再次发送到网络，避免快速往返跨屏时产生输入回传循环。远端鼠标移动仍可触发返回屏幕边缘的检测。释放采集时同步结束当前原生采集并丢弃旧会话队列，过期的移动事件和连接确认不能重新激活已经释放的会话；键鼠网络协议保持兼容。
+
 自动测试与本机窗口验证不能替代 macOS/macOS、Windows/Windows、Windows/macOS 的双机实测。
 
 扫描故障定位时，macOS 可用系统自带命令观察同一服务：

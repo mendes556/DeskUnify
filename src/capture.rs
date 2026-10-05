@@ -314,12 +314,9 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
-                    if let Some(active) = self.active_client {
-                        if handle != active {
-                            // we only care about events coming from the client we are currently connected to
-                            // only `Ack` and `Leave` are relevant
-                            continue
-                        }
+                    if Some(handle) != self.active_client {
+                        // Only Ack and Leave from the current client are relevant.
+                        continue;
                     }
 
                     match event {
@@ -388,6 +385,12 @@ impl CaptureTask {
         }
         log::trace!("({handle}): {event:?}");
 
+        // A release or another Begin can win the race against queued input.
+        // Only the current capture may forward events or retry Enter.
+        if matches!(event, CaptureEvent::Input(_)) && self.active_client != Some(handle) {
+            return Ok(());
+        }
+
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
@@ -444,6 +447,7 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.state = State::WaitingForAck;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
@@ -564,5 +568,68 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ClientManager;
+    use input_event::PointerEvent;
+    use webrtc_dtls::crypto::Certificate;
+
+    fn task(active_client: Option<u64>) -> CaptureTask {
+        let (_request_tx, request_rx) = channel();
+        let (event_tx, _event_rx) = channel();
+        CaptureTask {
+            paused: false,
+            active_client,
+            backend: Some(input_capture::Backend::Dummy),
+            cancellation_token: CancellationToken::new(),
+            captures: vec![
+                (0, Position::Left, CaptureType::Default),
+                (1, Position::Right, CaptureType::Default),
+            ],
+            conn: LanMouseConnection::new(
+                Certificate::generate_self_signed(["ignored".to_owned()]).unwrap(),
+                ClientManager::default(),
+            ),
+            event_tx,
+            request_rx,
+            release_bind: Rc::new(RefCell::new(vec![scancode::Linux::KeyLeftCtrl])),
+            state: State::Sending,
+        }
+    }
+
+    #[tokio::test]
+    async fn late_motion_cannot_restart_or_release_another_capture() {
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .unwrap();
+        let motion = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 100.,
+            dy: 0.,
+        }));
+        // If forwarded, this fixture would attempt a connection, and release
+        // the new active handle on send failure. It must be ignored entirely.
+        for active in [None, Some(1)] {
+            let mut task = task(active);
+            task.handle_capture_event(&mut capture, (0, motion))
+                .await
+                .unwrap();
+            assert_eq!(task.active_client, active);
+            assert_eq!(task.state, State::Sending);
+        }
+    }
+
+    #[tokio::test]
+    async fn releasing_capture_resets_acknowledgement_state() {
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .unwrap();
+        let mut task = task(None);
+        task.release_capture(&mut capture).await.unwrap();
+        assert_eq!(task.state, State::WaitingForAck);
     }
 }

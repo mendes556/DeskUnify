@@ -11,8 +11,8 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    MACOS_EMULATED_EVENT_TAG, PointerEvent, scancode,
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
@@ -198,7 +198,7 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
         flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
     }
     event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    post_emulated_event(&event);
     log::trace!("key event: {key} {state}");
 }
 
@@ -210,8 +210,13 @@ fn modifier_event(event_source: CGEventSource, depressed: XMods) {
     let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    post_emulated_event(&event);
     log::trace!("modifiers updated: {depressed:?}");
+}
+
+fn post_emulated_event(event: &CGEvent) {
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_EMULATED_EVENT_TAG);
+    event.post(CGEventTapLocation::HID);
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -333,7 +338,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
-                        event.post(CGEventTapLocation::HID);
+                        post_emulated_event(&event);
                     }
                     PointerEvent::Button {
                         time: _,
@@ -413,7 +418,7 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
-                        event.post(CGEventTapLocation::HID);
+                        post_emulated_event(&event);
                     }
                     PointerEvent::Axis {
                         time: _,
@@ -443,7 +448,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        post_emulated_event(&event);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
@@ -469,7 +474,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        post_emulated_event(&event);
                     }
                 }
 

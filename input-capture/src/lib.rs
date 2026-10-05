@@ -170,6 +170,7 @@ impl InputCapture {
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
+        self.pending.clear();
         self.capture.release().await
     }
 
@@ -363,4 +364,28 @@ async fn create(
         }
     }
     Err(last_error.unwrap_or(CaptureCreationError::NoAvailableBackend))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn release_discards_begin_fanout_from_previous_capture() {
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        capture.create(0, Position::Left).await.unwrap();
+        capture.create(1, Position::Left).await.unwrap();
+        assert_eq!(
+            capture.next().await.unwrap().unwrap(),
+            (0, CaptureEvent::Begin)
+        );
+        assert_eq!(capture.pending.len(), 1);
+        capture.release().await.unwrap();
+        // A fresh Begin belongs to handle 0; the old duplicate for handle 1
+        // would otherwise restart the just-released session.
+        assert_eq!(
+            capture.next().await.unwrap().unwrap(),
+            (0, CaptureEvent::Begin)
+        );
+    }
 }
