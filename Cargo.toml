@@ -27,6 +27,7 @@ panic = "abort"
 
 [build-dependencies]
 shadow-rs = "1.2.0"
+embed-resource = "3.0.11"
 
 [dependencies]
 input-event = { path = "input-event", version = "0.4.0" }
@@ -112,7 +113,7 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "DeskUnify"
-icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
+icon = ["lan-mouse-egui/icons/icon.icns", "lan-mouse-egui/icons/icon.ico", "lan-mouse-egui/icons/icon.png"]
 identifier = "de.feschber.LanMouse"
 deb_depends = [ "libadwaita-1-0" ]
 resources = ["target/menubar-template.png"]

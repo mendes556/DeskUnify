@@ -519,6 +519,7 @@ enum Tab {
 }
 
 pub(crate) struct BridgeApp {
+    logo: egui::TextureHandle,
     files: file_ui::FilePanel,
     worker: Worker,
     snapshot: Option<UiSnapshot>,
@@ -552,6 +553,16 @@ pub(crate) struct BridgeApp {
 impl BridgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, owns_daemon: bool) -> std::io::Result<Self> {
         configure_fonts(&cc.egui_ctx);
+        let icon = eframe::icon_data::from_png_bytes(crate::APP_ICON_PNG)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let logo = cc.egui_ctx.load_texture(
+            "deskunify-logo",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
         let theme = load_theme();
         let privacy = privacy::status();
         apply_theme(&cc.egui_ctx, theme);
@@ -565,6 +576,7 @@ impl BridgeApp {
                 .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
         });
         Ok(Self {
+            logo,
             files: file_ui::FilePanel::default(),
             worker: Worker::new(cc.egui_ctx.clone(), owns_daemon)?,
             snapshot: None,
@@ -782,17 +794,11 @@ impl BridgeApp {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
-            let painter = ui.painter();
-            gradient(painter, rect, self.theme.colors(), 10.0);
-            for offset in [egui::vec2(7.0, 8.0), egui::vec2(14.0, 15.0)] {
-                painter.rect_stroke(
-                    egui::Rect::from_min_size(rect.min + offset, egui::vec2(13.0, 11.0)),
-                    2.0,
-                    Stroke::new(1.7, Color32::WHITE),
-                    StrokeKind::Inside,
-                );
-            }
+            ui.add(
+                egui::Image::new(&self.logo)
+                    .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                    .corner_radius(10),
+            );
             ui.vertical(|ui| {
                 ui.label(RichText::new("DeskUnify").size(17.0).strong());
                 ui.label(RichText::new("连接你的工作空间").size(10.0).color(MUTED));
@@ -2495,6 +2501,11 @@ pub(crate) mod tests {
         let (commands, requests) = mpsc::channel();
         let (results, replies) = mpsc::channel();
         let app = BridgeApp {
+            logo: egui::Context::default().load_texture(
+                "test-logo",
+                egui::ColorImage::new([1, 1], vec![Color32::BLACK]),
+                egui::TextureOptions::LINEAR,
+            ),
             files: file_ui::FilePanel::default(),
             worker: Worker {
                 commands,

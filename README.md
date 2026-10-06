@@ -105,6 +105,8 @@ python scripts/package-release.py target/x86_64-pc-windows-msvc/release/lan-mous
 
 本地输出位于 `target/packages/`，包含程序 ZIP、校验文件、文档和源码提交信息，不包含设备配置、证书或私钥。
 
+界面 Logo 和应用图标使用 `lan-mouse-egui/icons/` 中的资源。macOS 打包使用 `icon.icns`；Windows 的 egui 构建将 `icon.ico` 嵌入 EXE，需 Windows SDK 的资源编译器（原生 MSVC 构建环境已提供）。
+
 ## 扫描与配对
 
 GUI 中扫描设备、核对对端完整指纹并配对，设置对方相对本机的屏幕位置。两台左右相邻的电脑应分别配置「右侧」与「左侧」。双方都需要授权对端身份。

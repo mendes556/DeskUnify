@@ -60,6 +60,8 @@ python3 scripts/package-release.py target/release/lan-mouse --platform macos-arm
 
 On Windows, build with `--target x86_64-pc-windows-msvc` and `RUSTFLAGS="-C target-feature=+crt-static"`, as in the workflow. Outputs go to `target/packages/`. Download and extract the matching platform ZIP; on macOS move DeskUnify.app to Applications, and on Windows run DeskUnify.exe from the extracted folder. Exit an old instance before updating; existing pairing/configuration is retained.
 
+UI and application icons are stored in `lan-mouse-egui/icons/`. macOS packaging uses `icon.icns`; Windows egui builds embed `icon.ico` in the executable using the Windows SDK resource compiler, available in native MSVC build environments.
+
 In another terminal:
 
 ```sh
