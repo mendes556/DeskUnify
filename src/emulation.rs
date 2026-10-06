@@ -425,6 +425,8 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
+        #[cfg(windows)]
+        let mut blocked_warning_after = Instant::now();
         loop {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
@@ -439,7 +441,19 @@ impl EmulationTask {
                                 handle
                             }
                         };
-                        emulation.consume(event, handle).await?;
+                        match emulation.consume(event, handle).await {
+                            #[cfg(windows)]
+                            Err(error @ input_emulation::EmulationError::WindowsInputBlocked { .. }) => {
+                                // Foreground integrity can change when the GUI is minimized.
+                                // Keep receiving so permitted input resumes without a backend restart.
+                                let now = Instant::now();
+                                if now >= blocked_warning_after {
+                                    log::warn!("{error}");
+                                    blocked_warning_after = now + Duration::from_secs(1);
+                                }
+                            }
+                            result => result?,
+                        }
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {

@@ -17,8 +17,8 @@ pub fn run(owns_daemon: bool) -> Result<(), EguiError> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("DeskUnify")
         .with_app_id("dev.lanbridge.desktop")
-        .with_inner_size([1160.0, 800.0])
-        .with_min_inner_size([860.0, 660.0]);
+        .with_inner_size([960.0, 640.0])
+        .with_min_inner_size([800.0, 520.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../icons/icon.png")) {
         viewport = viewport.with_icon(icon);
     }

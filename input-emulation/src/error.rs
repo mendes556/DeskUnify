@@ -22,6 +22,11 @@ use wayland_client::{
 pub enum EmulationError {
     #[error("event stream closed")]
     EndOfStream,
+    #[cfg(windows)]
+    #[error(
+        "Windows rejected shared input (error {code}); an elevated foreground window may require running DeskUnify as administrator"
+    )]
+    WindowsInputBlocked { code: u32 },
     #[cfg(libei)]
     #[error("libei error: `{0}`")]
     Libei(#[from] reis::Error),

@@ -61,6 +61,28 @@ cargo build --release -p lan-mouse --no-default-features --locked
 
 Windows 将可执行路径替换为 `./target/release/lan-mouse.exe`。为兼容已有配置和工具，Rust crate 与源码构建的可执行文件名称继续使用 `lan-mouse`，产品界面名称为 DeskUnify。
 
+Windows 可直接在仓库根目录通过启动脚本编译并运行 egui 桌面界面：
+
+```powershell
+.\start.ps1
+# 可选：使用 release 构建，首次编译耗时更长
+.\start.ps1 -Release
+# 如需共享输入到任务管理器等管理员窗口，先退出旧窗口及后台再启动
+.\start.ps1 -Admin
+```
+
+脚本自动为 x86_64 Windows GNU 工具链设置 Rust 随附的链接器，使用 MSVC 工具链时沿用原有链接器。默认使用 debug 构建；Cargo 会复用未变更的编译结果，编译失败时不会启动程序。无需每次手动设置环境变量，脚本结束时恢复原有链接器设置。可通过 `-AppArgs '--help'` 查看程序帮助。如果 PowerShell 提示禁止运行脚本，可使用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1` 启动，该参数仅影响此次 PowerShell 进程。
+
+Windows GNU 工具链若在 `generic-array` 等依赖的构建脚本中报链接错误，且包含 `_Unwind_Resume` 或 `_GCC_specific_handler`，先检查 `rustc -vV` 与 `gcc -v`。`x86_64-pc-windows-gnu` 配合旧版 SJLJ MinGW 会出现异常展开运行库不匹配。可在当前 PowerShell 中指定 Rust 随附的链接器，再重新构建：
+
+```powershell
+$rustSysroot = rustc --print sysroot
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "$rustSysroot\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained\x86_64-w64-mingw32-gcc.exe"
+cargo build -p lan-mouse --no-default-features --features egui --locked
+```
+
+仍需保留 MinGW 的 `gcc` 和 `dlltool` 在 `PATH` 中：Rust 随附的 GCC 仅用于链接，不能编译 C 依赖。上述设置仅对当前 PowerShell 及其子进程生效；新终端需要重新设置。MSVC 打包使用下文的 MSVC 工具链，不受此 GNU 链接器设置影响。
+
 ### 本地打包
 
 先构建带 `egui` 功能的 release 程序，再使用 Python 3.11 或更新版本打包：
