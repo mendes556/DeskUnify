@@ -6,6 +6,11 @@ pub mod client;
 mod clipboard;
 pub mod config;
 mod connect;
+#[cfg(any(target_os = "macos", windows))]
+mod control;
+#[cfg(not(any(target_os = "macos", windows)))]
+#[path = "control_unsupported.rs"]
+mod control;
 mod crypto;
 mod discovery;
 mod dns;
@@ -15,3 +20,4 @@ pub mod emulation_test;
 pub mod files;
 mod listen;
 pub mod service;
+mod sharing;

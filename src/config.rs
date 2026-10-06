@@ -64,6 +64,8 @@ fn default_path() -> Result<PathBuf, VarError> {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct ConfigToml {
     clipboard: Option<bool>,
+    file_directory: Option<PathBuf>,
+    clipboard_target: Option<String>,
     discovery: Option<bool>,
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
@@ -76,6 +78,8 @@ struct ConfigToml {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 struct TomlClient {
+    fingerprint: Option<String>,
+    sharing: Option<lan_mouse_ipc::Sharing>,
     hostname: Option<String>,
     host_name: Option<String>,
     ips: Option<Vec<IpAddr>>,
@@ -275,7 +279,10 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
+#[derive(Clone)]
 pub struct ConfigClient {
+    pub fingerprint: Option<String>,
+    pub sharing: lan_mouse_ipc::Sharing,
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
     pub port: u16,
@@ -295,6 +302,8 @@ impl From<TomlClient> for ConfigClient {
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
         Self {
+            fingerprint: toml.fingerprint,
+            sharing: toml.sharing.unwrap_or_default(),
             ips,
             hostname,
             port,
@@ -323,6 +332,8 @@ impl From<ConfigClient> for TomlClient {
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
         Self {
+            fingerprint: client.fingerprint,
+            sharing: Some(client.sharing),
             hostname,
             host_name,
             ips,
@@ -508,6 +519,28 @@ impl Config {
         config.clipboard = Some(clipboard);
     }
 
+    pub fn clipboard_target(&self) -> Option<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_target.clone())
+    }
+    pub fn set_clipboard_target(&mut self, target: Option<String>) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clipboard_target = target;
+    }
+    pub fn file_directory(&self) -> PathBuf {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.file_directory.clone())
+            .unwrap_or_else(|| self.config_dir.join("received-files"))
+    }
+    pub fn set_file_directory(&mut self, directory: PathBuf) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .file_directory = Some(directory);
+    }
+
     /// list of configured clients
     pub fn clients(&self) -> Vec<ConfigClient> {
         self.config_toml
@@ -516,7 +549,16 @@ impl Config {
             .unwrap_or_default()
             .into_iter()
             .flatten()
-            .map(From::<TomlClient>::from)
+            .map(|toml| {
+                let legacy = toml.sharing.is_none();
+                let mut client = ConfigClient::from(toml);
+                if legacy {
+                    if let Some(value) = self.config_toml.as_ref().and_then(|c| c.clipboard) {
+                        client.sharing.clipboard = value;
+                    }
+                }
+                client
+            })
             .collect()
     }
 
@@ -607,5 +649,30 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+    #[test]
+    fn device_preferences_survive_toml_and_partial_fields_default_on() {
+        let old: TomlClient =
+            toml::from_str("ips=['192.168.1.2']\nsharing={keyboard=false}\n").unwrap();
+        let mut c = ConfigClient::from(old);
+        assert!(c.sharing.mouse && c.sharing.clipboard && c.sharing.files);
+        assert!(!c.sharing.keyboard);
+        c.fingerprint = Some("saved-certificate-identity".into());
+        c.active = false;
+        let s = toml::to_string(&TomlClient::from(c.clone())).unwrap();
+        let restored = ConfigClient::from(toml::from_str::<TomlClient>(&s).unwrap());
+        assert_eq!(restored.sharing, c.sharing);
+        assert_eq!(restored.fingerprint, c.fingerprint);
+        assert!(!restored.active);
+        let new: TomlClient = toml::from_str("ips=['192.168.1.2']").unwrap();
+        assert_eq!(
+            ConfigClient::from(new).sharing,
+            lan_mouse_ipc::Sharing::default()
+        );
     }
 }

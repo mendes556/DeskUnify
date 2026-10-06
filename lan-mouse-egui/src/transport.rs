@@ -123,6 +123,16 @@ mod tests {
         );
         let mut old = snapshot();
         old.protocol_version -= 1;
+        let mut wire = serde_json::to_value(&old).unwrap();
+        for field in [
+            "pair_requests",
+            "clipboard_target",
+            "file_directory",
+            "files_error",
+        ] {
+            wire.as_object_mut().unwrap().remove(field);
+        }
+        let old = serde_json::from_value(wire).unwrap();
         let mut events = stream::iter([Ok(FrontendEvent::UiResult {
             id: "mine".into(),
             result: Ok(old),

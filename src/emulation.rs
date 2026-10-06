@@ -69,6 +69,7 @@ pub(crate) enum EmulationEvent {
 }
 
 enum EmulationRequest {
+    ReleasePeer(String, tokio::sync::oneshot::Sender<()>),
     SetPaused(bool, tokio::sync::oneshot::Sender<()>),
     Reenable,
     Release(SocketAddr),
@@ -80,11 +81,13 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        policies: crate::sharing::Policies,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
+            policies,
             paused: false,
             listener,
             emulation_proxy,
@@ -111,6 +114,16 @@ impl Emulation {
             .expect("channel closed");
     }
 
+    pub(crate) async fn release_peer(&self, fingerprint: String) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.request_tx
+            .send(EmulationRequest::ReleasePeer(fingerprint, reply))
+            .map_err(|_| "输入模拟已停止".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .map_err(|_| "释放输入超时".to_owned())?
+            .map_err(|_| "输入模拟已停止".to_owned())
+    }
     pub(crate) async fn set_paused(&self, paused: bool) -> Result<(), String> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.request_tx
@@ -145,6 +158,7 @@ impl Emulation {
 }
 
 struct ListenTask {
+    policies: crate::sharing::Policies,
     paused: bool,
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
@@ -155,6 +169,8 @@ struct ListenTask {
 impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut identities = HashMap::new();
+        let mut previous = HashMap::new();
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
         loop {
@@ -165,7 +181,7 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
-                                if self.paused {
+                                if self.paused || !identities.get(&addr).is_some_and(|fp: &String| {let p=crate::sharing::policy(&self.policies,fp);p.mouse||p.keyboard}) {
                                     self.listener.reply(addr, ProtoEvent::Leave(0)).await;
                                     continue;
                                 }
@@ -180,7 +196,7 @@ impl ListenTask {
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) if !self.paused => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) if !self.paused && identities.get(&addr).is_some_and(|fp: &String|crate::sharing::allows(crate::sharing::policy(&self.policies,fp),event)) => self.emulation_proxy.consume(event,addr),
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(!self.paused && self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -201,6 +217,7 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        identities.insert(addr,fingerprint.clone());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
@@ -216,6 +233,11 @@ impl ListenTask {
                 }
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
+                    EmulationRequest::ReleasePeer(fp,reply) => {
+                        for (addr,identity) in &identities {if *identity==fp {self.emulation_proxy.remove(*addr);}}
+                        // The ordered proxy queue confirms preceding releases.
+                        self.emulation_proxy.flush().await;let _=reply.send(());
+                    }
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     EmulationRequest::SetPaused(paused, reply) => {
                         self.paused = paused;
@@ -232,6 +254,10 @@ impl ListenTask {
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
+                    for (addr,fp) in &identities {
+                        let policy=crate::sharing::policy(&self.policies,fp);
+                        if previous.insert(*addr,policy).is_some_and(|old|old!=policy) {self.emulation_proxy.remove(*addr);}
+                    }
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
@@ -261,6 +287,7 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
+    Flush(tokio::sync::oneshot::Sender<()>),
     ReleaseAll(tokio::sync::oneshot::Sender<()>),
     Input(Event, SocketAddr),
     Remove(SocketAddr),
@@ -324,6 +351,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    async fn flush(&self) {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if self.request_tx.send(ProxyRequest::Flush(reply)).is_ok() {
+            let _ = response.await;
+        }
+    }
     async fn release_all(&self) {
         let (reply, response) = tokio::sync::oneshot::channel();
         if self
@@ -372,6 +405,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Flush(reply) => {
+                        let _ = reply.send(());
+                    }
                     ProxyRequest::ReleaseAll(reply) => {
                         self.handles.clear();
                         let _ = reply.send(());
@@ -462,6 +498,7 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
+                    ProxyRequest::Flush(reply) => {let _=reply.send(());}
                     ProxyRequest::ReleaseAll(reply) => {
                         for (_, handle) in self.handles.drain() { emulation.destroy(handle).await; }
                         let _ = reply.send(());
@@ -488,6 +525,9 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::Flush(reply) => {
+                let _ = reply.send(());
+            }
             ProxyRequest::ReleaseAll(reply) => {
                 let _ = reply.send(());
             }

@@ -19,12 +19,50 @@ pub(super) struct UiState {
 impl Service {
     fn ui_snapshot(&mut self) -> UiSnapshot {
         UiSnapshot {
+            #[cfg(any(target_os = "macos", windows))]
+            pair_requests: self
+                .pair_requests
+                .values()
+                .filter(|(_, _, reply)| !reply.is_closed())
+                .map(|(r, _, _)| r.clone())
+                .collect(),
+            #[cfg(not(any(target_os = "macos", windows)))]
+            pair_requests: vec![],
+            clipboard_target: self.target_client().map(|(id, _, _)| id),
+            file_directory: self.config.file_directory().display().to_string(),
+            #[cfg(any(target_os = "macos", windows))]
+            files_error: self.files.error(),
+            #[cfg(not(any(target_os = "macos", windows)))]
+            files_error: Some("自动文件剪贴板仅支持 macOS/Windows".into()),
             protocol_version: IPC_VERSION,
-            clients: self.client_manager.get_client_states(),
+            clients: self
+                .client_manager
+                .get_client_states()
+                .into_iter()
+                .map(|(id, c, mut s)| {
+                    #[cfg(any(target_os = "macos", windows))]
+                    if let Some(fp) = &c.fingerprint {
+                        if s.peer_sharing.is_some()
+                            && self
+                                .peer_seen
+                                .get(fp)
+                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(4))
+                        {
+                            s.peer_sharing = None;
+                            s.sharing_error = Some("连接已中断，等待对端后台".into());
+                        }
+                    }
+                    (id, c, s)
+                })
+                .collect(),
             fingerprint: self.public_key_fingerprint.clone(),
             authorized: self.authorized_keys.read().expect("lock").clone(),
             port: self.port,
-            clipboard: self.config.clipboard_enabled(),
+            clipboard: self
+                .client_manager
+                .clients()
+                .iter()
+                .any(|(c, s)| s.active && c.sharing.clipboard),
             clipboard_supported: cfg!(any(target_os = "macos", windows)),
             paused: self.ui.paused,
             active_client: self.ui.active_client,
@@ -73,21 +111,43 @@ impl Service {
                 enter_hook,
                 leave_hook,
             } => {
-                let description = hostname.clone().unwrap_or_else(|| ips[0].to_string());
-                let handle = self.client_manager.add_with_config(ConfigClient {
-                    hostname,
-                    ips: ips.into_iter().collect(),
-                    port,
-                    pos: position,
-                    active: false,
-                    enter_hook,
-                    leave_hook,
+                let description = hostname.clone().unwrap_or_else(|| {
+                    ips.first()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "远端设备".into())
                 });
+                let fingerprint = fingerprint.map(|s| s.to_ascii_lowercase());
+                let existing = fingerprint
+                    .as_ref()
+                    .and_then(|fp| self.client_manager.by_fingerprint(fp));
+                let handle = if let Some(id) = existing {
+                    self.update_fix_ips(id, ips);
+                    self.update_port(id, port);
+                    id
+                } else {
+                    self.client_manager.add_with_config(ConfigClient {
+                        fingerprint: fingerprint.clone().map(|s| s.to_ascii_lowercase()),
+                        sharing: Default::default(),
+                        hostname,
+                        ips: ips.into_iter().collect(),
+                        port,
+                        pos: position,
+                        active: false,
+                        enter_hook,
+                        leave_hook,
+                    })
+                };
                 let (config, state) = self.client_manager.get_state(handle).expect("new client");
                 self.notify_frontend(FrontendEvent::Created(handle, config, state));
                 self.activate_client(handle);
                 if let Some(fingerprint) = fingerprint {
                     self.add_authorized_key(description, fingerprint.to_ascii_lowercase());
+                }
+                if self.clipboard_target.is_none() {
+                    self.clipboard_target = self
+                        .client_manager
+                        .get_state(handle)
+                        .and_then(|(c, _)| c.fingerprint);
                 }
                 self.broadcast_client(handle);
             }
@@ -109,6 +169,7 @@ impl Service {
             }
             UiAction::RemoveClient { id } => {
                 self.require_client(id)?;
+                self.release_device(id).await?;
                 self.remove_client(id);
             }
             UiAction::SetHostname { id, hostname } => {
@@ -146,14 +207,43 @@ impl Service {
                     self.update_pos(id, position);
                 }
             }
+            UiAction::SetSharing { id, sharing } => {
+                self.require_client(id)?;
+                self.release_device(id).await?;
+                let (mut c, _) = self.client_manager.get_state(id).expect("checked client");
+                c.sharing = sharing;
+                self.client_manager.set_config(id, c);
+                self.configure_sharing();
+            }
+            UiAction::RejectPair { fingerprint } => {
+                self.rejected_pairs.insert(fingerprint.clone());
+                #[cfg(any(target_os = "macos", windows))]
+                if let Some((_, _, reply)) = self.pair_requests.remove(&fingerprint) {
+                    let _ = reply.send(crate::control::Reply::rejected("对端拒绝了配对请求"));
+                }
+                let _ = fingerprint;
+            }
+            UiAction::SetFileDirectory { directory } => {
+                let path = std::path::PathBuf::from(directory);
+                if !path.is_absolute() {
+                    return Err("接收目录必须是绝对路径".into());
+                }
+                self.config.set_file_directory(path);
+            }
             UiAction::SetActive { id, active } => {
+                self.release_device(id).await?;
                 self.require_client(id)?;
                 self.set_client_active(id, active);
             }
             UiAction::Authorize {
                 description,
                 fingerprint,
-            } => self.add_authorized_key(description, fingerprint.to_ascii_lowercase()),
+            } => {
+                let fp = fingerprint.to_ascii_lowercase();
+                self.add_authorized_key(description, fp.clone());
+                #[cfg(any(target_os = "macos", windows))]
+                self.approve_pair(&fp);
+            }
             UiAction::Revoke { fingerprint } => {
                 self.remove_authorized_key(fingerprint.to_ascii_lowercase())
             }
@@ -181,6 +271,18 @@ impl Service {
                     .await
                     .map_err(|_| "监听端口更改未确认，请刷新状态".to_owned())??;
                 }
+                // Compatibility command: an explicit change applies the text switch to each device.
+                let current = self
+                    .client_manager
+                    .clients()
+                    .iter()
+                    .any(|(c, s)| s.active && c.sharing.clipboard);
+                if current != clipboard {
+                    for (id, mut c, _) in self.client_manager.get_client_states() {
+                        c.sharing.clipboard = clipboard;
+                        self.client_manager.set_config(id, c);
+                    }
+                }
                 self.config.set_ui_settings(port, clipboard);
             }
             UiAction::SetPaused { paused } => {
@@ -188,15 +290,19 @@ impl Service {
                 // Resume is published only when both tasks confirm completion.
                 self.ui.paused = true;
                 #[cfg(any(target_os = "macos", windows))]
-                self.configure_clipboard();
+                self.configure_sharing();
                 #[cfg(any(target_os = "macos", windows))]
                 let clipboard_result = self.clipboard.wait_until_inactive().await;
+                #[cfg(any(target_os = "macos", windows))]
+                let files_result = self.files.wait_until_inactive().await;
                 let capture_result = self.capture.set_paused(true).await;
                 let emulation_result = self.emulation.set_paused(true).await;
                 capture_result?;
                 emulation_result?;
                 #[cfg(any(target_os = "macos", windows))]
                 clipboard_result?;
+                #[cfg(any(target_os = "macos", windows))]
+                files_result?;
                 if !paused {
                     self.emulation.set_paused(false).await?;
                     if let Err(error) = self.capture.set_paused(false).await {
@@ -234,8 +340,9 @@ impl Service {
                 self.ui.paused = true;
                 #[cfg(any(target_os = "macos", windows))]
                 {
-                    self.configure_clipboard();
+                    self.configure_sharing();
                     self.clipboard.wait_until_inactive().await?;
+                    self.files.wait_until_inactive().await?;
                 }
                 self.capture.release_confirmed().await?;
                 self.emulation.set_paused(true).await?;
@@ -246,11 +353,21 @@ impl Service {
             self.persist_config()
                 .map_err(|error| format!("操作已应用，但配置保存失败：{error}"))?;
         }
-        #[cfg(any(target_os = "macos", windows))]
-        self.configure_clipboard();
+        self.configure_sharing();
         Ok(self.ui_snapshot())
     }
 
+    async fn release_device(&self, id: ClientHandle) -> Result<(), String> {
+        self.capture.release_client(id).await?;
+        if let Some(fp) = self
+            .client_manager
+            .get_state(id)
+            .and_then(|(c, _)| c.fingerprint)
+        {
+            self.emulation.release_peer(fp).await?;
+        }
+        Ok(())
+    }
     fn require_client(&self, id: ClientHandle) -> Result<(), String> {
         self.client_manager
             .get_state(id)
@@ -296,7 +413,7 @@ fn validate(action: &UiAction) -> Result<(), String> {
 }
 
 fn validate_port(port: u16) -> Result<(), String> {
-    if port == 0 || (cfg!(windows) && port == 5252) {
+    if port == 0 || port > 65533 || (cfg!(windows) && (5250..=5252).contains(&port)) {
         Err("监听端口无效或与本机服务端口冲突".into())
     } else {
         Ok(())

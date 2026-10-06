@@ -17,6 +17,12 @@ pub struct ClientManager {
 }
 
 impl ClientManager {
+    pub fn by_fingerprint(&self, fingerprint: &str) -> Option<ClientHandle> {
+        self.get_client_states()
+            .into_iter()
+            .find_map(|(id, c, _)| (c.fingerprint.as_deref() == Some(fingerprint)).then_some(id))
+    }
+
     /// get all clients
     pub fn clients(&self) -> Vec<(ClientConfig, ClientState)> {
         self.clients
@@ -28,6 +34,8 @@ impl ClientManager {
 
     pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
+            fingerprint: config_client.fingerprint,
+            sharing: config_client.sharing,
             hostname: config_client.hostname,
             fix_ips: config_client.ips.into_iter().collect(),
             port: config_client.port,

@@ -61,6 +61,10 @@ pub(crate) enum CaptureType {
 #[derive(Debug)]
 enum CaptureRequest {
     SetPaused(bool, tokio::sync::oneshot::Sender<Result<(), String>>),
+    ReleaseClient(
+        CaptureHandle,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     ReleaseConfirmed(tokio::sync::oneshot::Sender<Result<(), String>>),
     /// capture must release the mouse
     Release,
@@ -121,6 +125,16 @@ impl Capture {
             .map_err(|_| "capture task stopped".to_owned())?
     }
 
+    pub(crate) async fn release_client(&self, id: CaptureHandle) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.request_tx
+            .send(CaptureRequest::ReleaseClient(id, reply))
+            .map_err(|_| "输入采集已停止".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .map_err(|_| "释放输入超时".to_owned())?
+            .map_err(|_| "输入采集已停止".to_owned())?
+    }
     pub(crate) async fn release_confirmed(&self) -> Result<(), String> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.request_tx
@@ -249,6 +263,7 @@ impl CaptureTask {
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
+                        CaptureRequest::ReleaseClient(_,reply) => {let _=reply.send(Ok(()));}
                         CaptureRequest::ReleaseConfirmed(reply) => { let _ = reply.send(Ok(())); }
                         CaptureRequest::SetPaused(paused, reply) => { self.paused = paused; let _ = reply.send(Ok(())); }
                         CaptureRequest::SetReleaseBind(bind) => {
@@ -307,8 +322,23 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut previous = None;
         loop {
             tokio::select! {
+                _=tick.tick()=>{
+                    if let Some(id)=self.active_client {let p=self.conn.sharing(id);
+                        if previous.is_some_and(|old|old!=p){self.release_capture(capture).await?;}
+                        previous=Some(p);
+                    }else{previous=None;}
+                    let mut filters=std::collections::HashMap::new();
+                    for (id,pos,kind) in self.captures.clone() {
+                        if kind==CaptureType::EnterOnly {filters.entry(pos).or_insert(lan_mouse_ipc::Sharing::default());}
+                        else {filters.insert(pos,self.conn.sharing(id));}
+                    }
+                    for (pos,p) in filters {capture.set_input_filter(pos,p.mouse,p.keyboard).await;}
+
+                },
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -336,6 +366,10 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::ReleaseClient(id,reply) => {
+                        let result=if self.active_client==Some(id){self.release_capture(capture).await}else{Ok(())};
+                        let _=reply.send(result.as_ref().map(|_|()).map_err(ToString::to_string));result?;
+                    }
                     CaptureRequest::ReleaseConfirmed(reply) => {
                         let result = self.release_capture(capture).await;
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
@@ -412,6 +446,16 @@ impl CaptureTask {
             }
             // we dont care about events from incoming handles except for releasing the capture
             return Ok(());
+        }
+
+        let sharing = self.conn.sharing(handle);
+        if !sharing.mouse && !sharing.keyboard {
+            return self.release_capture(capture).await;
+        }
+        if let CaptureEvent::Input(input) = event {
+            if !crate::sharing::allows(sharing, input) {
+                return Ok(());
+            }
         }
 
         // activated a new client
@@ -593,6 +637,7 @@ mod tests {
             conn: LanMouseConnection::new(
                 Certificate::generate_self_signed(["ignored".to_owned()]).unwrap(),
                 ClientManager::default(),
+                crate::sharing::Policies::default(),
             ),
             event_tx,
             request_rx,

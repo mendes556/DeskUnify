@@ -13,15 +13,15 @@ use tokio::{
 
 const DEBOUNCE: Duration = Duration::from_millis(350);
 
-struct Changes {
+pub(super) struct Changes {
     observed: native::Snapshot,
-    pending: Option<native::Snapshot>,
+    pub(super) pending: Option<native::Snapshot>,
     due: Instant,
     failures: u32,
 }
 
 impl Changes {
-    fn new(observed: native::Snapshot) -> Self {
+    pub(super) fn new(observed: native::Snapshot) -> Self {
         Self {
             observed,
             pending: None,
@@ -29,7 +29,7 @@ impl Changes {
             failures: 0,
         }
     }
-    fn observe(&mut self, snapshot: native::Snapshot, now: Instant) -> bool {
+    pub(super) fn observe(&mut self, snapshot: native::Snapshot, now: Instant) -> bool {
         if snapshot == self.observed {
             return false;
         }
@@ -40,12 +40,12 @@ impl Changes {
         self.failures = 0;
         true
     }
-    fn ready(&self, now: Instant) -> Option<Vec<PathBuf>> {
+    pub(super) fn ready(&self, now: Instant) -> Option<Vec<PathBuf>> {
         (now >= self.due)
             .then(|| self.pending.as_ref().map(|p| p.paths.clone()))
             .flatten()
     }
-    fn failed(&mut self, now: Instant) {
+    pub(super) fn failed(&mut self, now: Instant) {
         self.failures = self.failures.saturating_add(1);
         self.due = now + Duration::from_secs((1u64 << self.failures.min(5)).min(30));
     }

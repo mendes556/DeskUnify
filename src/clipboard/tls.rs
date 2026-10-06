@@ -16,7 +16,7 @@ pub(crate) type Authorized = Arc<RwLock<HashMap<String, String>>>;
 pub(super) const ALPN: &[u8] = b"lan-bridge-clipboard/1";
 
 #[derive(Debug)]
-struct PairedVerifier(Authorized);
+struct PairedVerifier(Authorized, bool);
 
 impl PairedVerifier {
     fn check(&self, cert: &CertificateDer<'_>) -> Result<(), Error> {
@@ -112,7 +112,9 @@ impl ClientCertVerifier for PairedVerifier {
         _: &[CertificateDer<'_>],
         _: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        self.check(cert)?;
+        if !self.1 {
+            self.check(cert)?;
+        }
         Ok(ClientCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -148,7 +150,20 @@ impl TlsConfig {
     }
 
     pub fn with_alpn(cert: &Certificate, keys: Authorized, alpn: &[u8]) -> Result<Self, Error> {
-        let verifier = Arc::new(PairedVerifier(keys));
+        Self::build(cert, keys, alpn, false)
+    }
+
+    pub fn control(cert: &Certificate, keys: Authorized, alpn: &[u8]) -> Result<Self, Error> {
+        Self::build(cert, keys, alpn, true)
+    }
+
+    fn build(
+        cert: &Certificate,
+        keys: Authorized,
+        alpn: &[u8],
+        allow_pair_request: bool,
+    ) -> Result<Self, Error> {
+        let verifier = Arc::new(PairedVerifier(keys, allow_pair_request));
         let key = || {
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                 cert.private_key.serialized_der.clone(),

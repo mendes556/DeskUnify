@@ -76,29 +76,15 @@ fn run() -> Result<(), LanMouseError> {
         None => {
             #[cfg(feature = "egui")]
             {
-                let mut service = if lan_mouse_ipc::is_service_running() {
+                let service = if lan_mouse_ipc::is_service_running() {
                     None
                 } else {
                     Some(start_service()?)
                 };
                 let result = lan_mouse_egui::run(service.is_some());
-                if let Some(ref mut service) = service {
-                    if service.try_wait()?.is_none() && lan_mouse_ipc::is_service_running() {
-                        if let Err(error) = run_async(lan_mouse_egui::shutdown()) {
-                            log::warn!("daemon shutdown: {error}");
-                        }
-                    }
-                    // Give the daemon time to release native input state before
-                    // falling back to terminating a child that did not exit.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                    while service.try_wait()?.is_none() && std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    if service.try_wait()?.is_none() {
-                        service.kill()?;
-                    }
-                    service.wait()?;
-                }
+                // The daemon owns device connections and clipboard transfers.
+                // Closing the window leaves sharing running; Shutdown is explicit.
+                drop(service);
                 result?;
             }
             //  otherwise start the service as a child process and

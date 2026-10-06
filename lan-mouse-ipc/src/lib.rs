@@ -59,7 +59,7 @@ pub enum IpcError {
 
 pub const DEFAULT_PORT: u16 = 4242;
 /// Local IPC schema version. UI and daemon must use matching builds.
-pub const IPC_VERSION: u32 = 6;
+pub const IPC_VERSION: u32 = 7;
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -131,8 +131,56 @@ impl TryFrom<&str> for Position {
     }
 }
 
+/// Persistent preferences; effective sharing is the intersection of both peers.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sharing {
+    pub mouse: bool,
+    pub keyboard: bool,
+    pub clipboard: bool,
+    pub files: bool,
+}
+impl Default for Sharing {
+    fn default() -> Self {
+        Self {
+            mouse: true,
+            keyboard: true,
+            clipboard: true,
+            files: true,
+        }
+    }
+}
+impl Sharing {
+    pub const OFF: Self = Self {
+        mouse: false,
+        keyboard: false,
+        clipboard: false,
+        files: false,
+    };
+    pub fn intersect(self, other: Self) -> Self {
+        Self {
+            mouse: self.mouse && other.mouse,
+            keyboard: self.keyboard && other.keyboard,
+            clipboard: self.clipboard && other.clipboard,
+            files: self.files && other.files,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRequest {
+    pub fingerprint: String,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub position: Position,
+    pub name: String,
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub sharing: Sharing,
     /// hostname of this client
     pub hostname: Option<String>,
     /// fix ips, determined by the user
@@ -150,6 +198,8 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            fingerprint: None,
+            sharing: Sharing::default(),
             port: DEFAULT_PORT,
             hostname: Default::default(),
             fix_ips: Default::default(),
@@ -164,6 +214,14 @@ pub type ClientHandle = u64;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
+    #[serde(default)]
+    pub peer_sharing: Option<Sharing>,
+    #[serde(default)]
+    pub peer_addr: Option<SocketAddr>,
+    #[serde(default)]
+    pub peer_note: Option<String>,
+    #[serde(default)]
+    pub sharing_error: Option<String>,
     /// events should be sent to and received from the client
     pub active: bool,
     /// `active` address of the client, used to send data to.
@@ -322,6 +380,16 @@ pub enum UiAction {
         id: ClientHandle,
         position: Position,
     },
+    SetSharing {
+        id: ClientHandle,
+        sharing: Sharing,
+    },
+    RejectPair {
+        fingerprint: String,
+    },
+    SetFileDirectory {
+        directory: String,
+    },
     SetActive {
         id: ClientHandle,
         active: bool,
@@ -363,6 +431,14 @@ pub struct DiscoveredDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSnapshot {
+    #[serde(default)]
+    pub pair_requests: Vec<PairRequest>,
+    #[serde(default)]
+    pub clipboard_target: Option<ClientHandle>,
+    #[serde(default)]
+    pub file_directory: String,
+    #[serde(default)]
+    pub files_error: Option<String>,
     pub protocol_version: u32,
     pub clients: Vec<(ClientHandle, ClientConfig, ClientState)>,
     pub fingerprint: String,

@@ -19,6 +19,15 @@ pub struct WindowsInputCapture {
 
 #[async_trait]
 impl Capture for WindowsInputCapture {
+    fn set_input_filter(
+        &mut self,
+        pos: Position,
+        mouse: bool,
+        keyboard: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        self.event_thread.set_input_filter(pos, mouse, keyboard);
+        Box::pin(async {})
+    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.event_thread.create(pos);
         Ok(())

@@ -171,6 +171,26 @@ enum CliSubcommand {
         #[arg(action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Show/change persistent per-device sharing; omitted switches are preserved
+    Sharing {
+        id: ClientHandle,
+        #[arg(long)]
+        mouse: Option<bool>,
+        #[arg(long)]
+        keyboard: Option<bool>,
+        #[arg(long)]
+        clipboard: Option<bool>,
+        #[arg(long)]
+        files: Option<bool>,
+    },
+    /// Decline a pending pairing request
+    RejectPair {
+        fingerprint: String,
+    },
+    /// Persist the daemon file receive directory
+    FileDirectory {
+        directory: String,
+    },
     /// Pause input send/receive and clipboard synchronization
     Pause,
     Resume,
@@ -301,6 +321,20 @@ fn status(s: &UiSnapshot) -> Result<(), CliError> {
     Ok(())
 }
 fn list(s: &UiSnapshot) -> Result<(), CliError> {
+    for request in &s.pair_requests {
+        text(format!(
+            "待配对 {} · {}\n指纹 {}\n允许：cli authorize {} {}",
+            clean(&request.name),
+            request.ip,
+            request.fingerprint,
+            clean(&request.name),
+            request.fingerprint
+        ))?;
+    }
+    text(format!(
+        "复制粘贴目标 {:?} · 文件接收目录 {}",
+        s.clipboard_target, s.file_directory
+    ))?;
     if s.clients.is_empty() {
         text("未配置设备")?;
     }
@@ -314,6 +348,17 @@ fn list(s: &UiSnapshot) -> Result<(), CliError> {
             state.alive,
             c.fix_ips
         ))?;
+        text(format!(
+            "  共享：鼠标={} 键盘={} 文字={} 文件={} · 对端 {:?}",
+            c.sharing.mouse,
+            c.sharing.keyboard,
+            c.sharing.clipboard,
+            c.sharing.files,
+            state.peer_sharing
+        ))?;
+        if let Some(note) = state.peer_note.as_ref().or(state.sharing_error.as_ref()) {
+            text(format!("  {note}"))?;
+        }
     }
     Ok(())
 }
@@ -571,6 +616,38 @@ pub async fn run(args: CliArgs) -> Result<(), CliError> {
             port: snapshot.port,
             clipboard: enabled,
         },
+        CliSubcommand::Sharing {
+            id,
+            mouse,
+            keyboard,
+            clipboard,
+            files,
+        } => {
+            let (_, c, _) = snapshot
+                .clients
+                .iter()
+                .find(|(cid, _, _)| *cid == id)
+                .ok_or_else(|| CliError::Invalid("设备不存在".into()))?;
+            if mouse.is_none() && keyboard.is_none() && clipboard.is_none() && files.is_none() {
+                return json(&c.sharing);
+            }
+            let mut sharing = c.sharing;
+            if let Some(v) = mouse {
+                sharing.mouse = v;
+            }
+            if let Some(v) = keyboard {
+                sharing.keyboard = v;
+            }
+            if let Some(v) = clipboard {
+                sharing.clipboard = v;
+            }
+            if let Some(v) = files {
+                sharing.files = v;
+            }
+            UiAction::SetSharing { id, sharing }
+        }
+        CliSubcommand::RejectPair { fingerprint } => UiAction::RejectPair { fingerprint },
+        CliSubcommand::FileDirectory { directory } => UiAction::SetFileDirectory { directory },
         CliSubcommand::Pause => UiAction::SetPaused { paused: true },
         CliSubcommand::Resume => UiAction::SetPaused { paused: false },
         CliSubcommand::Release => UiAction::Release,
@@ -597,6 +674,10 @@ mod tests {
     use lan_mouse_ipc::Status;
     fn snapshot() -> UiSnapshot {
         UiSnapshot {
+            pair_requests: vec![],
+            clipboard_target: None,
+            file_directory: String::new(),
+            files_error: None,
             protocol_version: IPC_VERSION,
             clients: vec![],
             fingerprint: "aa:bb".into(),

@@ -50,6 +50,10 @@ impl EventThread {
         }
     }
 
+    pub(crate) fn set_input_filter(&self, pos: Position, mouse: bool, keyboard: bool) {
+        self.client_update(ClientUpdate::Filter(pos, mouse, keyboard));
+    }
+
     pub(crate) fn release_capture(&self) {
         self.signal(RequestType::Release);
     }
@@ -94,6 +98,7 @@ enum RequestType {
 }
 
 enum ClientUpdate {
+    Filter(Position, bool, bool),
     Create(Position),
     Destroy(Position),
 }
@@ -110,6 +115,7 @@ fn try_send_event(
 }
 
 thread_local! {
+    static FILTERS: RefCell<std::collections::HashMap<Position,(bool,bool)>> = RefCell::new(std::collections::HashMap::new());
     /// all configured clients
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
     /// currently active client
@@ -327,8 +333,11 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         log::warn!("e: {e}");
     }
 
-    /* don't pass event to applications */
-    LRESULT(1)
+    if FILTERS.with_borrow(|f| f.get(&pos).is_some_and(|(mouse, _)| !*mouse)) {
+        CallNextHookEx(None, ncode, wparam, lparam)
+    } else {
+        LRESULT(1)
+    }
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -346,8 +355,11 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         log::warn!("e: {e}");
     }
 
-    /* don't pass event to applications */
-    LRESULT(1)
+    if FILTERS.with_borrow(|f| f.get(&client).is_some_and(|(_, keyboard)| !*keyboard)) {
+        CallNextHookEx(None, ncode, wparam, lparam)
+    } else {
+        LRESULT(1)
+    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -420,6 +432,11 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
 
 fn update_clients(request: ClientUpdate) {
     match request {
+        ClientUpdate::Filter(pos, mouse, keyboard) => {
+            FILTERS.with_borrow_mut(|f| {
+                f.insert(pos, (mouse, keyboard));
+            });
+        }
         ClientUpdate::Create(pos) => {
             CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
         }

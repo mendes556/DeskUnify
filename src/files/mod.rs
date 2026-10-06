@@ -1,6 +1,8 @@
 // DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 //! Opt-in, mutually authenticated file transfer, separate from input capture.
 mod disk;
+mod managed;
+pub(crate) use managed::{Managed, ManagedSettings};
 mod manifest;
 mod native;
 #[cfg(test)]
@@ -522,6 +524,17 @@ async fn receive_service(
     listen: SocketAddr,
     options: ReceiveOptions,
 ) -> io::Result<()> {
+    receive_managed(Some(config), tls, keys, output, listen, options).await
+}
+
+async fn receive_managed(
+    mut config: Option<&mut Config>,
+    tls: TlsConfig,
+    keys: Authorized,
+    output: PathBuf,
+    listen: SocketAddr,
+    options: ReceiveOptions,
+) -> io::Result<()> {
     tokio::fs::create_dir_all(&output).await?;
     let output = tokio::fs::canonicalize(output).await?;
     let listener = TcpListener::bind(listen).await?;
@@ -557,8 +570,9 @@ async fn receive_service(
                     if options.once && report.output.is_some() { return Ok(()); }
                 }
             },
-            changed = config.changed() => {
+            changed = async { match &mut config { Some(c) => c.changed().await, None => std::future::pending().await } } => {
                 changed.map_err(io::Error::other)?;
+                let config = config.as_mut().expect("config watcher");
                 if config.read_from_disk()? {
                     *keys.write().map_err(|_| invalid("授权锁不可用"))? = config.authorized_fingerprints();
                 }
@@ -660,6 +674,7 @@ async fn receive_connection(
             )
             .await?;
             if options.clipboard {
+                check_authorized(&keys, &cert)?;
                 let output = report
                     .output
                     .clone()

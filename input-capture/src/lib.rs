@@ -167,6 +167,10 @@ impl InputCapture {
         Ok(())
     }
 
+    pub async fn set_input_filter(&mut self, pos: Position, mouse: bool, keyboard: bool) {
+        self.capture.set_input_filter(pos, mouse, keyboard).await;
+    }
+
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
@@ -294,6 +298,14 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;
 
     /// release mouse
+    fn set_input_filter(
+        &mut self,
+        _pos: Position,
+        _mouse: bool,
+        _keyboard: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        Box::pin(async {})
+    }
     async fn release(&mut self) -> Result<(), CaptureError>;
 
     /// destroy the input capture

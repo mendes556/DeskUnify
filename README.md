@@ -15,9 +15,9 @@ DeskUnify 是基于 [Lan Mouse](https://github.com/feschber/lan-mouse) 开发的
 - **跨屏键鼠**：鼠标越过配置的屏幕边缘后进入另一台电脑，键盘输入跟随鼠标。
 - **扫描与配对**：通过 mDNS 发现同一局域网内的设备，核对完整指纹后授权连接。
 - **原生控制台**：管理屏幕布局、共享配置、连接诊断与系统权限；支持多种主题，默认紫色渐变。
-- **文本剪贴板**：可选的双向纯文本同步，使用双向认证 TLS，默认关闭。
+- **按设备共享**：鼠标、键盘、文字与文件复制粘贴分别控制，新配对默认全部开启。任一端关闭即停止该功能。
 - **文件传输**：流式发送文件和目录，支持 SHA-256 校验、中断续传与重复传输复用。
-- **自动文件复制粘贴**：两端启用后，新复制的文件自动发送到选定设备，接收完成后可在对端粘贴。
+- **自动文件复制粘贴**：配对后后台自动运行，跟随当前键鼠控制设备，回到本机后保留最近目标。
 - **CLI 与后台模式**：可独立使用命令行；文件传输不需要键鼠权限，也不要求键鼠后台运行。
 
 ## 下载与启动
@@ -109,7 +109,9 @@ python scripts/package-release.py target/x86_64-pc-windows-msvc/release/lan-mous
 
 ## 扫描与配对
 
-GUI 中扫描设备、核对对端完整指纹并配对，设置对方相对本机的屏幕位置。两台左右相邻的电脑应分别配置「右侧」与「左侧」。双方都需要授权对端身份。
+两端先运行新版程序。A 扫描 B、核对完整指纹并连接，B 点击「允许配对」后自动保存 A 的身份、地址和反向屏幕位置，无需在 B 再添加 A。已保存的开关和布局不会被重连覆盖。若四个边缘都已占用，新反向设备保持停用，需手动安排位置。
+
+此流程与按设备共享是当前源码功能，历史便携包需要重新构建后才能使用。
 
 CLI 在另一个终端中执行：
 
@@ -120,30 +122,35 @@ CLI 在另一个终端中执行：
 ./target/release/lan-mouse cli pair --fingerprint "对端完整指纹" --position right
 ```
 
-把示例中的指纹替换为在对端核对过的完整指纹。macOS 键鼠采集和模拟需要系统授权；GUI 提供权限引导。文件传输不需要辅助功能或输入监控权限。
+B 在 GUI 确认，或运行 `cli list` 查看请求，再执行 `cli authorize "设备 A" "A 的完整指纹"`；`cli reject-pair "A 的完整指纹"` 拒绝。把示例中的指纹替换为在对端核对过的完整指纹。macOS 键鼠采集和模拟需要系统授权；GUI 提供权限引导。文件传输不需要辅助功能或输入监控权限。
 
-默认端口为：键鼠 **UDP 4242**，文本剪贴板 **TCP 4242**，文件 **TCP 4243**，mDNS 发现 **UDP 5353**。两端需位于同一局域网，并允许相应防火墙流量。
+默认端口为：键鼠 **UDP 4242**，文本剪贴板 **TCP 4242**，文件 **TCP 4243**，配对与共享协商 **TCP 4244**，mDNS 发现 **UDP 5353**。两端需位于同一局域网，并允许相应防火墙流量。
 
 紧急返回本机：同时按左侧 **Ctrl + Shift + Alt/Option + Windows/Command**。
 
 ## 文件与自动复制粘贴
 
-在 GUI 的「文件传输」页选择对端 IP 和接收目录，两台电脑分别开启「自动复制粘贴」。之后新复制的文件会自动传输，完成后在另一台电脑粘贴即可。两端程序需保持运行，大文件需等待传输完成。
+在「设备与布局」选中设备，分别设置鼠标、键盘、文字剪贴板和文件复制粘贴。修改后自动保存；设备停用停止与它的全部共享，全局暂停停止所有自动共享。关闭窗口后后台继续运行，结束共享请使用「退出后台」或 `cli shutdown`。
 
-CLI 等效命令如下，先完成双方身份授权，将示例 IP 换成对端地址：
+文件页配置本机接收目录并查看状态。新复制的文件自动发送，完成后可在另一台电脑粘贴，无需点击发送。只发送有有效目标时的新复制内容；目标断开、停用或关闭该功能时不改投其他设备。进行中的文件传输保持原收件人，暂停/关闭对应共享会取消，重新复制同一批文件可续传。
 
 ```sh
-./target/release/lan-mouse files sync --to 192.168.1.11:4243 --output "$HOME/Downloads/DeskUnify"
+# id 从 cli list 获取；省略的开关保持原值
+./target/release/lan-mouse cli sharing 0 --keyboard false
+./target/release/lan-mouse cli sharing 0 --clipboard true --files true
+./target/release/lan-mouse cli file-directory "$HOME/Downloads/DeskUnify"
+./target/release/lan-mouse cli pause
+./target/release/lan-mouse cli resume
 ```
 
-也可以手动传输：
+独立 CLI 传输仍可用于排障或手工发送，它独立于 daemon 的开关和暂停；请使用另外的端口避免占用后台自动接收端口：
 
 ```sh
 # 接收端
-./target/release/lan-mouse files receive --output "$HOME/Downloads/DeskUnify"
+./target/release/lan-mouse files receive --listen 0.0.0.0:4343 --output "$HOME/Downloads/DeskUnify"
 
 # 发送端，替换接收端地址与文件路径
-./target/release/lan-mouse files send --to 192.168.1.11:4243 --mode full "/文件或目录的完整路径"
+./target/release/lan-mouse files send --to 192.168.1.11:4343 --mode full "/文件或目录的完整路径"
 ```
 
 文件按批次保存到独立目录。中断后重新发送同一批文件可续传。每台电脑生成并使用自己的身份，不要分发私钥或复制另一台电脑的证书身份。

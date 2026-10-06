@@ -40,6 +40,26 @@ pub enum ServiceError {
 }
 
 pub struct Service {
+    policies: crate::sharing::Policies,
+    control: crate::control::Control,
+    #[cfg(any(target_os = "macos", windows))]
+    files: crate::files::Managed,
+    #[cfg(any(target_os = "macos", windows))]
+    clipboard_keys: crate::clipboard::tls::Authorized,
+    #[cfg(any(target_os = "macos", windows))]
+    file_keys: crate::clipboard::tls::Authorized,
+    #[cfg(any(target_os = "macos", windows))]
+    pair_requests: HashMap<
+        String,
+        (
+            lan_mouse_ipc::PairRequest,
+            lan_mouse_ipc::Sharing,
+            tokio::sync::oneshot::Sender<crate::control::Reply>,
+        ),
+    >,
+    rejected_pairs: HashSet<String>,
+    peer_seen: HashMap<String, std::time::Instant>,
+    clipboard_target: Option<String>,
     ui: ui::UiState,
     discovery: crate::discovery::Discovery,
     #[cfg(any(target_os = "macos", windows))]
@@ -86,6 +106,17 @@ struct Incoming {
 
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
+        #[cfg(any(target_os = "macos", windows))]
+        if config.port() == 0
+            || config.port() > 65533
+            || (cfg!(windows) && (5250..=5252).contains(&config.port()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "共享端口必须为 1–65533，Windows 还需避开 5250–5252",
+            )
+            .into());
+        }
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -102,21 +133,54 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let policies = crate::sharing::Policies::default();
+        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone(), policies.clone());
         #[cfg(any(target_os = "macos", windows))]
-        let clipboard = ClipboardSync::new(cert.clone(), authorized_keys.clone());
+        let clipboard_keys = crate::clipboard::tls::Authorized::default();
+        #[cfg(any(target_os = "macos", windows))]
+        let file_keys = crate::clipboard::tls::Authorized::default();
+        #[cfg(any(target_os = "macos", windows))]
+        let clipboard = ClipboardSync::new(cert.clone(), clipboard_keys.clone());
+        #[cfg(any(target_os = "macos", windows))]
+        let control = crate::control::Control::new(cert.clone(), authorized_keys.clone());
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let control = crate::control::Control;
+        #[cfg(any(target_os = "macos", windows))]
+        let files = crate::files::Managed::new(cert.clone(), file_keys.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, policies.clone());
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let initial_target = {
+            let clients = client_manager.clients();
+            let mut fps = clients
+                .iter()
+                .filter(|(_, s)| s.active)
+                .filter_map(|(c, _)| c.fingerprint.clone());
+            let first = fps.next();
+            if fps.next().is_none() { first } else { None }
+        };
         let service = Self {
+            policies,
+            rejected_pairs: Default::default(),
+            peer_seen: Default::default(),
+            clipboard_target: config.clipboard_target().or(initial_target),
+            control,
+            #[cfg(any(target_os = "macos", windows))]
+            files,
+            #[cfg(any(target_os = "macos", windows))]
+            file_keys,
+            #[cfg(any(target_os = "macos", windows))]
+            clipboard_keys,
+            #[cfg(any(target_os = "macos", windows))]
+            pair_requests: Default::default(),
             ui: Default::default(),
             discovery: crate::discovery::Discovery::new(public_key_fingerprint.clone()),
             #[cfg(any(target_os = "macos", windows))]
@@ -154,12 +218,17 @@ impl Service {
             self.activate_client(handle);
         }
 
+        let mut sharing_tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
+            self.reconcile_identities();
+            self.configure_sharing();
             self.discovery
                 .configure(self.config.discovery_enabled(), self.port);
             #[cfg(any(target_os = "macos", windows))]
             self.configure_clipboard();
             tokio::select! {
+                _ = sharing_tick.tick() => {},
+                event = control_event(&mut self.control) => self.handle_control_dispatch(event).await,
                 request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -183,30 +252,361 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
         #[cfg(any(target_os = "macos", windows))]
-        self.clipboard.terminate().await;
+        {
+            self.clipboard.terminate().await;
+            self.control.terminate().await;
+            self.files.terminate().await;
+        }
 
         Ok(())
     }
 
+    fn reconcile_identities(&mut self) {
+        let discovered = self.discovery.devices();
+        let authorized = self.authorized_keys.read().expect("lock").clone();
+        let mut changed = false;
+        for (id, mut c, s) in self.client_manager.get_client_states() {
+            if c.fingerprint.is_some() {
+                continue;
+            }
+            let matches = discovered
+                .iter()
+                .filter(|peer| {
+                    peer.port == c.port
+                        && authorized.contains_key(&peer.fingerprint)
+                        && peer.ips.iter().any(|ip| s.ips.contains(ip))
+                })
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                c.fingerprint = Some(matches[0].fingerprint.clone());
+                self.client_manager.set_config(id, c);
+                changed = true;
+            }
+        }
+        if changed {
+            if self.clipboard_target.is_none() {
+                let mut peers = self
+                    .client_manager
+                    .clients()
+                    .into_iter()
+                    .filter(|(_, s)| s.active)
+                    .filter_map(|(c, _)| c.fingerprint);
+                let first = peers.next();
+                if peers.next().is_none() {
+                    self.clipboard_target = first;
+                }
+            }
+            self.save_config();
+        }
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    fn peer_note(&self, active: bool) -> Option<String> {
+        if self.ui.paused {
+            Some("对端已暂停共享".into())
+        } else if !active {
+            Some("对端已停用此设备".into())
+        } else {
+            self.ui
+                .emulation_error
+                .as_ref()
+                .map(|error| format!("对端输入模拟尚未就绪：{error}"))
+        }
+    }
+    fn configure_sharing(&self) {
+        let mut policies = HashMap::new();
+        let authorized = self.authorized_keys.read().expect("lock");
+        for (_, config, state) in self.client_manager.get_client_states() {
+            if let Some(fp) = config.fingerprint {
+                #[cfg(any(target_os = "macos", windows))]
+                let live = self
+                    .peer_seen
+                    .get(&fp)
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(4));
+                #[cfg(not(any(target_os = "macos", windows)))]
+                let live = true;
+                #[cfg(any(target_os = "macos", windows))]
+                let remote = state.peer_sharing.unwrap_or(lan_mouse_ipc::Sharing::OFF);
+                #[cfg(not(any(target_os = "macos", windows)))]
+                let remote = lan_mouse_ipc::Sharing::default();
+                let effective =
+                    if state.active && !self.ui.paused && live && authorized.contains_key(&fp) {
+                        config.sharing.intersect(remote)
+                    } else {
+                        lan_mouse_ipc::Sharing::OFF
+                    };
+                policies.insert(fp, effective);
+            }
+        }
+        *self.policies.write().expect("lock") = policies;
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let peers = self
+                .client_manager
+                .get_client_states()
+                .into_iter()
+                .filter_map(|(id, c, s)| {
+                    let fp = c.fingerprint?;
+                    if !authorized.contains_key(&fp) {
+                        return None;
+                    }
+                    let ip = s
+                        .peer_addr
+                        .or(s.active_addr)
+                        .map(|a| a.ip())
+                        .or_else(|| c.fix_ips.first().copied())
+                        .or_else(|| s.dns_ips.first().copied())?;
+                    Some(crate::control::Peer {
+                        id,
+                        fingerprint: fp,
+                        addr: SocketAddr::new(ip, c.port),
+                        alternates: s
+                            .ips
+                            .iter()
+                            .filter(|other| **other != ip)
+                            .map(|ip| SocketAddr::new(*ip, c.port))
+                            .collect(),
+                        position: c.pos,
+                        note: self.peer_note(s.active),
+                        sharing: if s.active && !self.ui.paused {
+                            c.sharing
+                        } else {
+                            lan_mouse_ipc::Sharing::OFF
+                        },
+                    })
+                })
+                .collect();
+            self.control.configure(crate::control::Settings {
+                port: self.port,
+                peers,
+            });
+            let policies = self.policies.read().expect("lock");
+            *self.clipboard_keys.write().expect("lock") = authorized
+                .iter()
+                .filter(|(fp, _)| policies.get(*fp).is_some_and(|p| p.clipboard))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            *self.file_keys.write().expect("lock") = authorized
+                .iter()
+                .filter(|(fp, _)| policies.get(*fp).is_some_and(|p| p.files))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            drop(policies);
+            self.configure_clipboard();
+            let target = self.target_client().and_then(|(_, c, s)| {
+                let fp = c.fingerprint?;
+                if !self.file_keys.read().expect("lock").contains_key(&fp) {
+                    return None;
+                }
+                let ip = s
+                    .peer_addr
+                    .or(s.active_addr)
+                    .map(|a| a.ip())
+                    .or_else(|| c.fix_ips.first().copied())?;
+                Some((SocketAddr::new(ip, c.port.checked_add(1)?), fp))
+            });
+            self.files.configure(crate::files::ManagedSettings {
+                port: self.port.saturating_add(1),
+                output: self.config.file_directory(),
+                target,
+                enabled: !self.ui.paused && !self.file_keys.read().expect("lock").is_empty(),
+            });
+        }
+    }
+    fn target_client(
+        &self,
+    ) -> Option<(
+        ClientHandle,
+        lan_mouse_ipc::ClientConfig,
+        lan_mouse_ipc::ClientState,
+    )> {
+        let fp = self.clipboard_target.as_deref()?;
+        let id = self.client_manager.by_fingerprint(fp)?;
+        let (c, s) = self.client_manager.get_state(id)?;
+        Some((id, c, s))
+    }
     #[cfg(any(target_os = "macos", windows))]
     fn configure_clipboard(&self) {
         let peers = self
-            .client_manager
-            .clients()
+            .target_client()
             .into_iter()
-            .filter(|(_, state)| state.active)
-            .flat_map(|(config, state)| {
-                state
-                    .ips
-                    .into_iter()
-                    .map(move |ip| SocketAddr::new(ip, config.port))
+            .filter(|(_, c, _)| {
+                c.fingerprint
+                    .as_ref()
+                    .is_some_and(|fp| self.clipboard_keys.read().expect("lock").contains_key(fp))
+            })
+            .flat_map(|(_, c, s)| {
+                let ip = s
+                    .peer_addr
+                    .or(s.active_addr)
+                    .map(|a| a.ip())
+                    .or_else(|| c.fix_ips.first().copied());
+                ip.map(|ip| SocketAddr::new(ip, c.port))
             })
             .collect();
+        let fingerprint = self.target_client().and_then(|(_, c, _)| c.fingerprint);
         self.clipboard.configure(ClipboardSettings {
-            enabled: self.config.clipboard_enabled() && !self.ui.paused,
+            fingerprint,
+            enabled: !self.ui.paused && !self.clipboard_keys.read().expect("lock").is_empty(),
             port: self.port,
             peers,
         });
+    }
+    async fn handle_control_dispatch(&mut self, event: crate::control::Event) {
+        #[cfg(any(target_os = "macos", windows))]
+        self.handle_control_event(event).await;
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = event;
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    async fn handle_control_event(&mut self, event: crate::control::Event) {
+        use crate::control::{Event, Reply};
+        match event {
+            Event::Request {
+                request,
+                sharing,
+                note,
+                reply,
+            } => {
+                let fp = request.fingerprint.clone();
+                if self.rejected_pairs.contains(&fp)
+                    || (self.client_manager.by_fingerprint(&fp).is_some()
+                        && !self.authorized_keys.read().expect("lock").contains_key(&fp))
+                {
+                    let _ = reply.send(Reply::rejected("对端拒绝配对，请由对端重新授权"));
+                } else if self.authorized_keys.read().expect("lock").contains_key(&fp) {
+                    let id = self.ensure_reverse_client(&request);
+                    if let Some((c, mut s)) = self.client_manager.get_state(id) {
+                        s.peer_sharing = Some(sharing);
+                        s.peer_note = note;
+                        s.sharing_error = None;
+                        self.client_manager.set_state(id, s.clone());
+                        self.peer_seen.insert(fp, std::time::Instant::now());
+                        let mut response = Reply::accepted(if s.active && !self.ui.paused {
+                            c.sharing
+                        } else {
+                            lan_mouse_ipc::Sharing::OFF
+                        });
+                        response.note = self.peer_note(s.active);
+                        let _ = reply.send(response);
+                    }
+                } else if self.pair_requests.len() < 16 && !self.pair_requests.contains_key(&fp) {
+                    self.pair_requests.insert(fp, (request, sharing, reply));
+                } else {
+                    let _ = reply.send(Reply::rejected("已有待确认请求，请在对端确认配对"));
+                }
+            }
+            Event::Updated {
+                id,
+                fingerprint,
+                result,
+            } => {
+                if let Some((c, mut s)) = self
+                    .client_manager
+                    .get_state(id)
+                    .filter(|(c, _)| c.fingerprint.as_deref() == Some(&fingerprint))
+                {
+                    match result {
+                        Ok(response) => {
+                            s.peer_sharing = Some(response.sharing);
+                            s.peer_note = response.note;
+                            s.peer_addr = response.verified_addr;
+                            s.sharing_error = None;
+                            self.peer_seen
+                                .insert(fingerprint, std::time::Instant::now());
+                        }
+                        Err(error) => {
+                            s.peer_sharing = None;
+                            s.sharing_error = Some(error);
+                            self.peer_seen.remove(&fingerprint);
+                        }
+                    }
+                    self.client_manager.set_state(id, s);
+                    let _ = c;
+                }
+            }
+            Event::Error(error) => log::warn!("pairing service: {error}"),
+        }
+        self.pair_requests
+            .retain(|_, (_, _, reply)| !reply.is_closed());
+        self.configure_sharing();
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    fn ensure_reverse_client(&mut self, request: &lan_mouse_ipc::PairRequest) -> ClientHandle {
+        if let Some(id) = self.client_manager.by_fingerprint(&request.fingerprint) {
+            if let Some((mut c, _)) = self.client_manager.get_state(id) {
+                // Preserve policy, enabled state and user layout; refresh the authenticated address.
+                if !c.fix_ips.contains(&request.ip) {
+                    c.fix_ips = vec![request.ip];
+                    self.client_manager.set_config(id, c);
+                    self.client_manager.set_fix_ips(id, vec![request.ip]);
+                    self.save_config();
+                }
+            }
+            return id;
+        }
+        // Bind a legacy IP entry once, only after certificate authorization.
+        let legacy = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .find(|(_, c, _)| {
+                c.fingerprint.is_none() && c.fix_ips.contains(&request.ip) && c.port == request.port
+            });
+        if let Some((id, mut c, _)) = legacy {
+            c.fingerprint = Some(request.fingerprint.clone());
+            self.client_manager.set_config(id, c);
+            self.save_config();
+            return id;
+        }
+        let desired = request.position.opposite();
+        let position = [
+            desired,
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ]
+        .into_iter()
+        .find(|p| self.client_manager.client_at(*p).is_none());
+        let id = self.client_manager.add_with_config(ConfigClient {
+            fingerprint: Some(request.fingerprint.clone()),
+            sharing: Default::default(),
+            ips: HashSet::from([request.ip]),
+            hostname: None,
+            port: request.port,
+            pos: position.unwrap_or(desired),
+            active: false,
+            enter_hook: None,
+            leave_hook: None,
+        });
+        if position.is_some() {
+            self.activate_client(id);
+        }
+        if self.clipboard_target.is_none() {
+            self.clipboard_target = Some(request.fingerprint.clone());
+        }
+        self.save_config();
+        self.broadcast_client(id);
+        id
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    fn approve_pair(&mut self, fp: &str) {
+        self.rejected_pairs.remove(fp);
+        if let Some((request, sharing, reply)) = self.pair_requests.remove(fp) {
+            let id = self.ensure_reverse_client(&request);
+            let (c, mut s) = self.client_manager.get_state(id).expect("paired client");
+            s.peer_sharing = Some(sharing);
+            self.client_manager.set_state(id, s.clone());
+            self.peer_seen
+                .insert(fp.to_owned(), std::time::Instant::now());
+            let _ = reply.send(crate::control::Reply::accepted(
+                if s.active && !self.ui.paused {
+                    c.sharing
+                } else {
+                    lan_mouse_ipc::Sharing::OFF
+                },
+            ));
+        }
     }
 
     async fn handle_frontend_request(
@@ -285,6 +685,8 @@ impl Service {
         let clients = clients
             .into_iter()
             .map(|(c, s)| ConfigClient {
+                fingerprint: c.fingerprint,
+                sharing: c.sharing,
                 ips: HashSet::from_iter(c.fix_ips),
                 hostname: c.hostname,
                 port: c.port,
@@ -294,6 +696,8 @@ impl Service {
                 leave_hook: c.leave_cmd,
             })
             .collect();
+        self.config
+            .set_clipboard_target(self.clipboard_target.clone());
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
@@ -344,6 +748,8 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                self.clipboard_target = Some(fingerprint.clone());
+                self.save_config();
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -427,6 +833,11 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 if !self.ui.paused {
                     self.ui.active_client = Some(handle);
+                    self.clipboard_target = self
+                        .client_manager
+                        .get_state(handle)
+                        .and_then(|(c, _)| c.fingerprint);
+                    self.save_config();
                 }
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Enter);
@@ -549,6 +960,11 @@ impl Service {
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
+        self.rejected_pairs.insert(fp.clone());
+        #[cfg(any(target_os = "macos", windows))]
+        if let Some((_, _, reply)) = self.pair_requests.remove(&fp) {
+            let _ = reply.send(crate::control::Reply::rejected("设备授权已撤销"));
+        }
         self.authorized_keys.write().expect("lock").remove(&fp);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
@@ -721,4 +1137,8 @@ impl std::fmt::Display for HookKind {
             HookKind::Leave => f.write_str("leave"),
         }
     }
+}
+
+async fn control_event(control: &mut crate::control::Control) -> crate::control::Event {
+    control.event().await
 }

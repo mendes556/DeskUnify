@@ -46,6 +46,7 @@ const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
+    fingerprint: Option<String>,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     let conn = Arc::new(
@@ -58,6 +59,21 @@ async fn connect(
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
+        verify_peer_certificate: Some(Arc::new(move |certs, _| {
+            #[cfg(not(any(target_os = "macos", windows)))]
+            if fingerprint.is_none() {
+                return Ok(());
+            }
+            if fingerprint.as_ref().is_some_and(|fp| {
+                certs
+                    .first()
+                    .is_some_and(|cert| crate::crypto::generate_fingerprint(cert) == *fp)
+            }) {
+                Ok(())
+            } else {
+                Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+            }
+        })),
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
@@ -74,10 +90,11 @@ async fn connect(
 async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
+    fingerprint: Option<String>,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), fingerprint.clone()));
     }
     loop {
         match joinset.join_next().await {
@@ -93,6 +110,7 @@ async fn connect_any(
 }
 
 pub(crate) struct LanMouseConnection {
+    policies: crate::sharing::Policies,
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
@@ -103,9 +121,14 @@ pub(crate) struct LanMouseConnection {
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        policies: crate::sharing::Policies,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
+            policies,
             cert,
             client_manager,
             conns: Default::default(),
@@ -114,6 +137,26 @@ impl LanMouseConnection {
             recv_tx,
             ping_response: Default::default(),
         }
+    }
+
+    pub(crate) fn sharing(&self, handle: ClientHandle) -> lan_mouse_ipc::Sharing {
+        self.client_manager
+            .get_state(handle)
+            .and_then(|(c, _)| c.fingerprint)
+            .map(|fp| crate::sharing::policy(&self.policies, &fp))
+            .unwrap_or_else(|| {
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    lan_mouse_ipc::Sharing::OFF
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
+                {
+                    self.client_manager
+                        .get_state(handle)
+                        .map(|(c, _)| c.sharing)
+                        .unwrap_or(lan_mouse_ipc::Sharing::OFF)
+                }
+            })
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
@@ -185,7 +228,10 @@ async fn connect_to_handle(
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
+        let fingerprint = client_manager
+            .get_state(handle)
+            .and_then(|(c, _)| c.fingerprint);
+        let res = connect_any(&addrs, cert, fingerprint).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
@@ -303,6 +349,7 @@ async fn disconnect(
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
+    client_manager.set_alive(handle, false);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();

@@ -32,6 +32,7 @@ pub(crate) struct Settings {
     pub enabled: bool,
     pub port: u16,
     pub peers: Vec<SocketAddr>,
+    pub fingerprint: Option<String>,
 }
 
 pub(crate) struct ClipboardSync {
@@ -206,6 +207,8 @@ async fn session_with_clipboard(
                 if changed.is_err() { break; }
                 let current = settings.borrow_and_update().clone();
                 if !current.enabled || current.port != port { break; }
+                // A target change must not replay a previous copy to a new recipient.
+                latest=None;
                 // Removing a destination also cancels any transfer in flight.
                 outgoing.abort_all();
                 while outgoing.join_next().await.is_some() {}
@@ -233,8 +236,9 @@ async fn session_with_clipboard(
                         let update = update.clone();
                         let client = config.client.clone();
                         let keys = authorized.clone();
+                        let fingerprint=settings.borrow().fingerprint.clone();
                         outgoing.spawn(async move {
-                            let result = timeout(TRANSFER_TIMEOUT, send_update(peer, client, keys, &update)).await;
+                            let result = timeout(TRANSFER_TIMEOUT, send_update_pinned(peer, client, keys, &update, fingerprint.as_deref())).await;
                             (peer, update.revision, matches!(result, Ok(Ok(()))))
                         });
                     }
@@ -309,11 +313,22 @@ fn observe(state: &mut State, latest: &mut Option<Arc<Update>>, text: Option<Str
     }
 }
 
+#[cfg(test)]
 async fn send_update(
     peer: SocketAddr,
     config: Arc<rustls::ClientConfig>,
     authorized: Authorized,
     update: &Update,
+) -> io::Result<()> {
+    send_update_pinned(peer, config, authorized, update, None).await
+}
+
+async fn send_update_pinned(
+    peer: SocketAddr,
+    config: Arc<rustls::ClientConfig>,
+    authorized: Authorized,
+    update: &Update,
+    fingerprint: Option<&str>,
 ) -> io::Result<()> {
     let stream = TcpStream::connect(peer).await?;
     let name =
@@ -328,6 +343,9 @@ async fn send_update(
         return Err(wire::invalid(
             "unpaired clipboard server or unsupported protocol",
         ));
+    }
+    if fingerprint.is_some_and(|fp| crate::crypto::generate_fingerprint(cert.as_ref()) != fp) {
+        return Err(wire::invalid("clipboard target identity changed"));
     }
     wire::write_update(&mut stream, update).await?;
     if stream.read_u8().await? != 1 {
@@ -597,11 +615,13 @@ mod tests {
         let b_addr = b_listener.local_addr().unwrap();
         drop(b_listener);
         let (a_settings, mut a_changes) = watch::channel(Settings {
+            fingerprint: None,
             enabled: true,
             port: a_addr.port(),
             peers: vec![b_addr],
         });
         let (b_settings, mut b_changes) = watch::channel(Settings {
+            fingerprint: None,
             enabled: true,
             port: b_addr.port(),
             peers: vec![a_addr],

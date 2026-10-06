@@ -52,6 +52,8 @@ struct Bounds {
 
 #[derive(Debug)]
 struct InputCaptureState {
+    filters: std::collections::HashMap<Position, (bool, bool)>,
+    cursor_hidden: bool,
     /// active capture positions
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
@@ -78,6 +80,8 @@ enum ProducerEvent {
 impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
+            filters: Default::default(),
+            cursor_hidden: false,
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
             enter_position: None,
@@ -139,8 +143,11 @@ impl InputCaptureState {
             Position::Bottom => location.y = self.bounds.ymax - edge_offset,
         };
         self.enter_position = Some(location);
-        self.reset_cursor()?;
-        self.hide_cursor()?;
+        if self.filters.get(&position).is_none_or(|(mouse, _)| *mouse) {
+            self.reset_cursor()?;
+            self.hide_cursor()?;
+            self.cursor_hidden = true;
+        }
         self.current_pos = Some(position);
         Ok(())
     }
@@ -162,7 +169,8 @@ impl InputCaptureState {
 
     fn release_capture(&mut self) -> Result<(), CaptureError> {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        if self.current_pos.take().is_some() {
+        if self.current_pos.take().is_some() && self.cursor_hidden {
+            self.cursor_hidden = false;
             self.show_cursor()?;
         }
         Ok(())
@@ -546,13 +554,18 @@ fn create_event_tap<'a>(
                 });
 
                 // Keep (hidden) cursor at the edge of the screen
-                if matches!(
-                    event_type,
-                    CGEventType::MouseMoved
-                        | CGEventType::LeftMouseDragged
-                        | CGEventType::RightMouseDragged
-                        | CGEventType::OtherMouseDragged
-                ) {
+                if state
+                    .filters
+                    .get(&current_pos)
+                    .is_none_or(|(mouse, _)| *mouse)
+                    && matches!(
+                        event_type,
+                        CGEventType::MouseMoved
+                            | CGEventType::LeftMouseDragged
+                            | CGEventType::RightMouseDragged
+                            | CGEventType::OtherMouseDragged
+                    )
+                {
                     state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
                 }
             }
@@ -570,6 +583,14 @@ fn create_event_tap<'a>(
             EventRoute::PassThrough => return CallbackResult::Keep,
         }
 
+        let keyboard_event = matches!(
+            event_type,
+            CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+        );
+        let suppress = capture_position.is_some_and(|pos| {
+            let (mouse, keyboard) = state.filters.get(&pos).copied().unwrap_or((true, true));
+            if keyboard_event { keyboard } else { mouse }
+        });
         let generation = state.generation.load(Ordering::Relaxed);
         // The bounded send can block. Release must be able to lock the state
         // and invalidate these events even when the consumer is catching up.
@@ -583,8 +604,12 @@ fn create_event_tap<'a>(
             });
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
-            cg_ev.set_type(CGEventType::Null);
-            CallbackResult::Drop
+            if suppress {
+                cg_ev.set_type(CGEventType::Null);
+                CallbackResult::Drop
+            } else {
+                CallbackResult::Keep
+            }
         } else {
             CallbackResult::Keep
         }
@@ -804,6 +829,20 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
+    fn set_input_filter(
+        &mut self,
+        pos: Position,
+        mouse: bool,
+        keyboard: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        Box::pin(async move {
+            self.state
+                .lock()
+                .await
+                .filters
+                .insert(pos, (mouse, keyboard));
+        })
+    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
@@ -960,6 +999,8 @@ mod tests {
 
     fn idle_state() -> InputCaptureState {
         InputCaptureState {
+            filters: Default::default(),
+            cursor_hidden: false,
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
             enter_position: None,

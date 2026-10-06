@@ -451,7 +451,7 @@ struct Worker {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    fn new(ctx: egui::Context, owns_daemon: bool) -> std::io::Result<Self> {
+    fn new(ctx: egui::Context, _owns_daemon: bool) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -461,7 +461,6 @@ impl Worker {
             .name("lan-bridge-ui-ipc".into())
             .spawn(move || {
                 let mut next_poll = Instant::now();
-                let mut shutdown_confirmed = false;
                 loop {
                     let request =
                         requests.recv_timeout(next_poll.saturating_duration_since(Instant::now()));
@@ -473,7 +472,7 @@ impl Worker {
                     // One ordered worker prevents old polls from overwriting confirmed operations.
                     let shutdown = matches!(action, UiAction::Shutdown);
                     let result = runtime.block_on(transport::execute(action));
-                    shutdown_confirmed = shutdown && result.is_ok();
+                    let shutdown_confirmed = shutdown && result.is_ok();
                     if results.send(Reply { label, result }).is_err() {
                         break;
                     }
@@ -482,11 +481,6 @@ impl Worker {
                         break;
                     }
                     next_poll = Instant::now() + Duration::from_secs(1);
-                }
-                if owns_daemon && !shutdown_confirmed {
-                    if let Err(error) = runtime.block_on(crate::shutdown()) {
-                        log::warn!("{error}");
-                    }
                 }
             })?;
         Ok(Self {
@@ -991,7 +985,7 @@ impl BridgeApp {
                     } else {
                         "关闭"
                     },
-                    "全局设置",
+                    "按设备配置",
                 );
             });
         });
@@ -1197,6 +1191,60 @@ impl BridgeApp {
                         );
                     }
                 });
+                ui.add_space(10.0);
+                ui.label(RichText::new("此设备的共享功能").strong());
+                let mut sharing = config.sharing;
+                let mut changed = false;
+                ui.add_enabled_ui(self.online && !self.busy, |ui| {
+                    changed |= ui
+                        .checkbox(&mut sharing.mouse, "鼠标（移动、按键和滚轮）")
+                        .changed();
+                    changed |= ui.checkbox(&mut sharing.keyboard, "键盘").changed();
+                    changed |= ui
+                        .checkbox(&mut sharing.clipboard, "文字复制粘贴")
+                        .changed();
+                    changed |= ui.checkbox(&mut sharing.files, "文件复制粘贴").changed();
+                });
+                if changed {
+                    self.send(
+                        UiAction::SetSharing { id: *id, sharing },
+                        "保存设备共享设置",
+                    );
+                }
+                if snapshot.paused {
+                    ui.label("全局已暂停");
+                } else if !state.active {
+                    ui.label("设备已停用，四项共享均停止");
+                } else if let Some(error) = &state.sharing_error {
+                    ui.colored_label(RED, format!("连接或配对尚未就绪：{error}"));
+                } else if let Some(peer) = state.peer_sharing {
+                    if let Some(note) = &state.peer_note {
+                        ui.colored_label(MUTED, note);
+                    }
+                    let off = [
+                        (!peer.mouse, "鼠标"),
+                        (!peer.keyboard, "键盘"),
+                        (!peer.clipboard, "文字"),
+                        (!peer.files, "文件"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(off, label)| off.then_some(label))
+                    .collect::<Vec<_>>();
+                    if !off.is_empty() {
+                        ui.label(format!("对端关闭：{}", off.join("、")));
+                    } else {
+                        ui.label("双方共享设置已确认");
+                    }
+                    if !snapshot.native_ready() {
+                        ui.label("键鼠权限尚未就绪；文字和文件共享独立运行");
+                    }
+                } else {
+                    ui.label(if config.fingerprint.is_none() {
+                        "请扫描配对设备，核对并保存对端指纹"
+                    } else {
+                        "等待对端确认共享设置（需要两端使用新版）"
+                    });
+                }
                 ui.collapsing("连接详情", |ui| {
                     client_details(ui, config, state);
                 });
@@ -1427,7 +1475,7 @@ impl BridgeApp {
         card(ui, |ui| self.settings_backend_info(ui, snapshot));
     }
 
-    fn settings_connection(&mut self, ui: &mut egui::Ui, snapshot: &UiSnapshot) {
+    fn settings_connection(&mut self, ui: &mut egui::Ui, _snapshot: &UiSnapshot) {
         section_title(ui, "连接与同步", "配置会保存到当前后台");
         ui.add_enabled_ui(!self.busy, |ui| {
             ui.horizontal(|ui| {
@@ -1437,15 +1485,12 @@ impl BridgeApp {
                     .changed();
             });
         });
-        ui.add_enabled_ui(snapshot.clipboard_supported && !self.busy, |ui| {
-            self.settings_dirty |= ui
-                .checkbox(&mut self.settings_clipboard, "共享文本剪贴板")
-                .changed();
-        });
         ui.label(
-            RichText::new("剪贴板仅在已授权设备间传输文本；暂停共享时停止同步。")
-                .size(12.0)
-                .color(MUTED),
+            RichText::new(
+                "鼠标、键盘、文字和文件开关在「设备与布局」的具体设备中设置；新配对默认全部开启。",
+            )
+            .size(12.0)
+            .color(MUTED),
         );
         ui.add_enabled_ui(self.online && !self.busy, |ui| {
             if ui.add(primary_button(ui, "保存设置")).clicked() {
@@ -1765,7 +1810,7 @@ impl BridgeApp {
         ui.add_space(14.0);
         card(ui, |ui| {
             section_title(ui, "使用提示", "完成诊断后还需实体跨屏验证");
-            ui.label("连接建立需要先将鼠标移到配置的屏幕边缘；两端都要核对指纹并相互授权。就绪后，请逐项实测键盘、修饰键、鼠标点击、滚轮、跨屏返回和紧急释放。");
+            ui.label("A 发起配对、B 允许后自动建立双向设备；控制键鼠时将鼠标移到对应屏幕边缘。就绪后，请逐项实测键盘、修饰键、鼠标点击、滚轮、跨屏返回和紧急释放。");
             ui.label("原生后端失败时先处理权限错误，再重新检测；macOS 新授权可能需要完全退出启动 App 并重新运行后台。");
         });
     }
@@ -1781,7 +1826,7 @@ impl BridgeApp {
             .frame(dialog_frame(ctx))
             .show(ctx, |ui| {
                 close_clicked = dialog_header(ui, "退出后台");
-                ui.label("停止本机键鼠共享与剪贴板同步，释放输入并关闭窗口。配置会保留。");
+                ui.label("停止本机全部共享和自动文件传输，释放输入并关闭窗口。配置会保留。");
                 if !self.owns_daemon {
                     ui.label("此操作也会停止你从 CLI 启动的现有后台。");
                 }
@@ -1922,7 +1967,7 @@ impl BridgeApp {
             }
             ui.add_space(8.0);
             if ui.add_enabled(self.online && !self.busy, egui::Button::new("重新扫描")).clicked() { self.send(UiAction::Scan, "扫描局域网"); }
-            ui.label(RichText::new("选择设备后，请在对方核对完整指纹；两端均需授权。").size(11.0).color(MUTED));
+            ui.label(RichText::new("选择设备并核对指纹；对端点击允许后会自动添加反向设备。").size(11.0).color(MUTED));
         });
         self.scan_open &= open && !close_clicked;
     }
@@ -2056,7 +2101,6 @@ impl eframe::App for BridgeApp {
             }
         }
         self.receive();
-        self.files.poll();
         if self.shutdown_confirmed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -2095,13 +2139,52 @@ impl eframe::App for BridgeApp {
                 );
                 self.header(ui);
                 self.permission_banner(ui);
+                if let Some(request) = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.pair_requests.first())
+                    .cloned()
+                {
+                    card(ui, |ui| {
+                        section_title(
+                            ui,
+                            "新设备请求配对",
+                            &format!("{} · {}", request.name, request.ip),
+                        );
+                        ui.label("确认允许后，将自动建立双向连接并默认开启四项共享。");
+                        ui.label(RichText::new(&request.fingerprint).monospace().size(10.0));
+                        ui.add_enabled_ui(!self.busy, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.add(primary_button(ui, "允许配对")).clicked() {
+                                    self.send(
+                                        UiAction::Authorize {
+                                            description: request.name.clone(),
+                                            fingerprint: request.fingerprint.clone(),
+                                        },
+                                        "允许配对",
+                                    );
+                                }
+                                if ui.button("拒绝").clicked() {
+                                    self.send(
+                                        UiAction::RejectPair {
+                                            fingerprint: request.fingerprint.clone(),
+                                        },
+                                        "拒绝配对",
+                                    );
+                                }
+                            });
+                        });
+                    });
+                }
                 let mut scroll = egui::ScrollArea::vertical().id_salt(self.tab as u8);
                 if self.reset_scroll {
                     scroll = scroll.vertical_scroll_offset(0.0);
                 }
                 scroll.show(ui, |ui| {
                     if self.tab == Tab::Files {
-                        self.files.show(ui, self.snapshot.as_ref());
+                        if let Some(action) = self.files.show(ui, self.snapshot.as_ref()) {
+                            self.send(action, "保存文件配置");
+                        }
                         return;
                     }
                     if let Some(snapshot) = self.snapshot.clone() {
@@ -2549,6 +2632,10 @@ pub(crate) mod tests {
     }
     pub(crate) fn snapshot() -> UiSnapshot {
         UiSnapshot {
+            pair_requests: vec![],
+            clipboard_target: None,
+            file_directory: String::new(),
+            files_error: None,
             protocol_version: lan_mouse_ipc::IPC_VERSION,
             clients: vec![(
                 7,
