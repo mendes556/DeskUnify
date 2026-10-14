@@ -6,6 +6,7 @@ use std::time::Duration;
 
 #[derive(Default)]
 pub(super) struct UiState {
+    pub control_error: Option<lan_mouse_ipc::ConnectionIssue>,
     pub paused: bool,
     pub capture_backend: Option<String>,
     pub emulation_backend: Option<String>,
@@ -19,12 +20,13 @@ pub(super) struct UiState {
 impl Service {
     fn ui_snapshot(&mut self) -> UiSnapshot {
         UiSnapshot {
+            control_error: self.ui.control_error.clone(),
             #[cfg(any(target_os = "macos", windows))]
             pair_requests: self
                 .pair_requests
                 .values()
-                .filter(|(_, _, reply)| !reply.is_closed())
-                .map(|(r, _, _)| r.clone())
+                .filter(|(_, _, _, reply)| !reply.is_closed())
+                .map(|(r, _, _, _)| r.clone())
                 .collect(),
             #[cfg(not(any(target_os = "macos", windows)))]
             pair_requests: vec![],
@@ -50,6 +52,12 @@ impl Service {
                         {
                             s.peer_sharing = None;
                             s.sharing_error = Some("连接已中断，等待对端后台".into());
+                            s.connection = Some(lan_mouse_ipc::ConnectionState::Failed(
+                                lan_mouse_ipc::ConnectionIssue::new(
+                                    lan_mouse_ipc::ConnectionIssueKind::Interrupted,
+                                    "control heartbeat expired",
+                                ),
+                            ));
                         }
                     }
                     (id, c, s)
@@ -98,6 +106,7 @@ impl Service {
                 | UiAction::Release
                 | UiAction::RetryBackends
                 | UiAction::Scan
+                | UiAction::RetryClient { .. }
                 | UiAction::Shutdown
         );
         match action {
@@ -218,7 +227,7 @@ impl Service {
             UiAction::RejectPair { fingerprint } => {
                 self.rejected_pairs.insert(fingerprint.clone());
                 #[cfg(any(target_os = "macos", windows))]
-                if let Some((_, _, reply)) = self.pair_requests.remove(&fingerprint) {
+                if let Some((_, _, _, reply)) = self.pair_requests.remove(&fingerprint) {
                     let _ = reply.send(crate::control::Reply::rejected("对端拒绝了配对请求"));
                 }
                 let _ = fingerprint;
@@ -234,6 +243,27 @@ impl Service {
                 self.release_device(id).await?;
                 self.require_client(id)?;
                 self.set_client_active(id, active);
+            }
+            UiAction::RetryClient { id } => {
+                self.require_client(id)?;
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    let (c, mut s) = self.client_manager.get_state(id).expect("checked client");
+                    if !s.active {
+                        return Err("请先启用此设备，再重试连接".into());
+                    }
+                    if c.fingerprint.as_ref().is_none_or(|fp| {
+                        !self.authorized_keys.read().expect("lock").contains_key(fp)
+                    }) {
+                        return Err("请先核对并授权对端指纹，再重试连接".into());
+                    }
+                    self.control.retry(id)?;
+                    s.connection = Some(lan_mouse_ipc::ConnectionState::Connecting);
+                    s.sharing_error = None;
+                    self.client_manager.set_state(id, s);
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
+                return Err("此平台使用原有输入连接流程，请将鼠标移到配置边缘重试".into());
             }
             UiAction::Authorize {
                 description,

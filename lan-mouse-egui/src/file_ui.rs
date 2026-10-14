@@ -8,7 +8,13 @@ pub(super) struct FilePanel {
     saved: String,
 }
 impl FilePanel {
-    pub fn show(&mut self, ui: &mut egui::Ui, snapshot: Option<&UiSnapshot>) -> Option<UiAction> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: Option<&UiSnapshot>,
+        online: bool,
+        busy: bool,
+    ) -> Option<UiAction> {
         page_title(
             ui,
             "FILES",
@@ -30,19 +36,22 @@ impl FilePanel {
                 .clients
                 .iter()
                 .find(|(id, _, _)| Some(*id) == snapshot.clipboard_target);
-            if snapshot.paused {
+            if !online {
+                ui.colored_label(RED, "本机后台离线，当前显示最后一次状态");
+            } else if snapshot.paused {
                 ui.label("共享已暂停");
             } else if let Some((_, config, state)) = target {
                 ui.label(format!("当前目标：{}", super::client_name(config)));
-                let enabled = state.active
-                    && config.sharing.files
-                    && state.peer_sharing.is_some_and(|p| p.files)
-                    && state.sharing_error.is_none();
-                ui.label(if enabled {
+                let report = crate::feedback::device(snapshot, config, state, online);
+                let capability = &report.capabilities[3];
+                ui.label(if capability.available {
                     "已开启 · 复制文件即可发送"
                 } else {
-                    "暂不可用 · 请检查设备的文件共享设置和连接状态"
+                    &capability.reason
                 });
+                if !capability.available {
+                    ui.label(RichText::new(&report.guidance).color(MUTED));
+                }
             } else {
                 ui.label("尚未选择目标 · 将鼠标移动到已配对设备后，复制粘贴会跟随该设备");
             }
@@ -59,7 +68,10 @@ impl FilePanel {
                 "文件校验完成后放入本机剪贴板，已有文件不会被覆盖",
             );
             ui.text_edit_singleline(&mut self.directory);
-            if ui.add(primary_button(ui, "保存接收目录")).clicked() {
+            if ui
+                .add_enabled(online && !busy, primary_button(ui, "保存接收目录"))
+                .clicked()
+            {
                 action = Some(UiAction::SetFileDirectory {
                     directory: self.directory.trim().into(),
                 });

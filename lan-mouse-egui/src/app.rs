@@ -1,5 +1,8 @@
 // DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
-use crate::{privacy, transport};
+use crate::{
+    feedback::{self, Remedy, Tone},
+    privacy, transport,
+};
 #[path = "file_ui.rs"]
 mod file_ui;
 use eframe::egui::{self, Color32, RichText, Stroke, StrokeKind};
@@ -450,6 +453,11 @@ struct Worker {
     replies: mpsc::Receiver<Reply>,
     thread: Option<thread::JoinHandle<()>>,
 }
+
+struct Notification {
+    notice: feedback::Notice,
+    expires: Instant,
+}
 impl Worker {
     fn new(ctx: egui::Context, _owns_daemon: bool) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -533,6 +541,8 @@ pub(crate) struct BridgeApp {
     trust_name: String,
     trust_fingerprint: String,
     logs: VecDeque<String>,
+    feedback: feedback::Tracker,
+    notifications: VecDeque<Notification>,
     privacy: privacy::PrivacyStatus,
     next_privacy: Instant,
     permission_dialog_open: bool,
@@ -590,6 +600,8 @@ impl BridgeApp {
             trust_name: String::new(),
             trust_fingerprint: String::new(),
             logs: VecDeque::new(),
+            feedback: feedback::Tracker::default(),
+            notifications: VecDeque::new(),
             privacy,
             next_privacy: Instant::now(),
             permission_dialog_open: false,
@@ -692,6 +704,16 @@ impl BridgeApp {
                         if label == "保存设备" || label == "删除设备" {
                             self.form = None;
                         }
+                        if label == "保存设备" {
+                            self.message =
+                                "设备配置已保存；连接与共享是否可用，请查看设备状态".into();
+                        }
+                        if label == "允许配对" || label == "授权设备" {
+                            self.message = "配对授权已保存；正在确认连接与各项共享能力".into();
+                        }
+                        if label == "重试连接" {
+                            self.message = "已开始重试连接；结果会显示在对应设备上".into();
+                        }
                         if label == "授权设备" {
                             self.trust_name.clear();
                             self.trust_fingerprint.clear();
@@ -746,15 +768,25 @@ impl BridgeApp {
                                     "{}：{}",
                                     client_name(config),
                                     if state.alive {
-                                        "连接已建立"
+                                        "键鼠通道已建立"
                                     } else {
-                                        "连接已断开"
+                                        "键鼠通道已断开"
                                     }
                                 ));
                             }
                         }
                     }
                     self.online = !self.shutdown_confirmed;
+                    for notice in self.feedback.update(&snapshot) {
+                        self.record(format!("{}：{}", notice.title, notice.body));
+                        if self.notifications.len() >= 4 {
+                            self.notifications.pop_front();
+                        }
+                        self.notifications.push_back(Notification {
+                            notice,
+                            expires: Instant::now() + Duration::from_secs(7),
+                        });
+                    }
                     self.snapshot = Some(snapshot);
                 }
                 Err(error) => {
@@ -784,6 +816,170 @@ impl BridgeApp {
             self.permission_dialog_open = true;
             self.permission_request_next_frame = true;
         }
+    }
+    fn notifications(&mut self, ctx: &egui::Context) {
+        self.notifications
+            .retain(|notice| notice.expires > Instant::now());
+        let Some(notification) = self.notifications.back() else {
+            return;
+        };
+        let notice = notification.notice.clone();
+        let mut close = false;
+        let mut view = false;
+        let width = (ctx.content_rect().width() - 32.0).clamp(240.0, 390.0);
+        egui::Area::new("connection_notice".into())
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(panel(ui))
+                    .stroke(Stroke::new(1.0, tone_color(notice.tone)))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(
+                                tone_color(notice.tone),
+                                RichText::new(&notice.title).strong(),
+                            );
+                            close = ui.small_button("×").on_hover_text("关闭提示").clicked();
+                        });
+                        ui.label(RichText::new(&notice.body).size(12.0).color(MUTED));
+                        view = ui
+                            .button(if notice.id.is_some() {
+                                "查看设备"
+                            } else {
+                                "查看诊断"
+                            })
+                            .clicked();
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_millis(250));
+        if view {
+            self.tab = if notice.id.is_some() {
+                Tab::Devices
+            } else {
+                Tab::Diagnostics
+            };
+            self.selected_client = notice.id.or(self.selected_client);
+            self.reset_scroll = true;
+        }
+        if close || view {
+            self.notifications.pop_back();
+        }
+    }
+
+    fn feedback_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: u64,
+        config: &ClientConfig,
+        state: &ClientState,
+        remedies: &[Remedy],
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            for remedy in remedies {
+                match remedy {
+                    Remedy::Retry => {
+                        if ui
+                            .add_enabled(self.online && !self.busy, primary_button(ui, "重试连接"))
+                            .clicked()
+                        {
+                            self.send(UiAction::RetryClient { id }, "重试连接");
+                        }
+                    }
+                    Remedy::Edit => {
+                        if ui.button("检查 IP / 端口").clicked() {
+                            self.form = Some(DeviceForm::client(id, config, state));
+                        }
+                    }
+                    Remedy::Trust => {
+                        if ui.button("查看配对授权").clicked() {
+                            self.tab = Tab::Trust;
+                            self.reset_scroll = true;
+                        }
+                    }
+                    Remedy::LocalPermissions => {
+                        if ui.button("处理本机权限").clicked() {
+                            if cfg!(target_os = "macos") {
+                                self.permission_dialog_open = true;
+                            } else {
+                                self.tab = Tab::Settings;
+                                self.reset_scroll = true;
+                            }
+                        }
+                    }
+                    Remedy::RemotePermissions => {
+                        ui.label(
+                            RichText::new(
+                                "请在对端打开「共享设置」处理系统权限，再重新检测输入后端",
+                            )
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                    }
+                    Remedy::RemoteSettings => {
+                        ui.label(
+                            RichText::new("请在对端检查暂停状态及此设备的共享开关")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
+                    Remedy::Resume => {
+                        if ui
+                            .add_enabled(self.online && !self.busy, primary_button(ui, "恢复共享"))
+                            .clicked()
+                        {
+                            self.send(UiAction::SetPaused { paused: false }, "恢复共享");
+                        }
+                    }
+                    Remedy::Enable => {
+                        if ui
+                            .add_enabled(
+                                self.online && !self.busy,
+                                primary_button(ui, "启用此设备"),
+                            )
+                            .clicked()
+                        {
+                            self.send(UiAction::SetActive { id, active: true }, "启用设备");
+                        }
+                    }
+                    Remedy::Files => {
+                        if ui.button("查看文件服务").clicked() {
+                            self.tab = Tab::Files;
+                            self.reset_scroll = true;
+                        }
+                    }
+                    Remedy::Diagnostics => {
+                        if ui.button("查看诊断").clicked() {
+                            self.tab = Tab::Diagnostics;
+                            self.reset_scroll = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn connection_banner(&mut self, ui: &mut egui::Ui) {
+        let issue = self.snapshot.as_ref().and_then(|s| s.control_error.clone());
+        if self.online && issue.is_none() {
+            return;
+        }
+        card(ui, |ui| {
+            if !self.online {
+                ui.colored_label(RED, "本机后台离线；以下为最后一次状态");
+                ui.label("请启动当前版本后台；界面会自动尝试重新连接。");
+            } else if let Some(issue) = issue {
+                ui.colored_label(RED, issue.summary());
+                ui.label(issue.guidance());
+                ui.collapsing("技术详情", |ui| {
+                    ui.label(&issue.detail);
+                });
+            }
+        });
+        ui.add_space(12.0);
     }
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
@@ -958,7 +1154,7 @@ impl BridgeApp {
                     &snapshot
                         .clients
                         .iter()
-                        .filter(|(_, _, s)| s.alive)
+                        .filter(|(_, _, s)| self.online && feedback::connected(snapshot, s))
                         .count()
                         .to_string(),
                     "台电脑",
@@ -966,7 +1162,9 @@ impl BridgeApp {
                 metric(
                     &mut columns[2],
                     "输入状态",
-                    if snapshot.native_ready() {
+                    if !self.online {
+                        "离线"
+                    } else if snapshot.native_ready() {
                         "就绪"
                     } else {
                         "待处理"
@@ -1030,14 +1228,16 @@ impl BridgeApp {
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    if snapshot.native_ready() {
+                    if self.online && snapshot.native_ready() {
                         GREEN
                     } else {
                         MUTED
                     },
                     "●",
                 );
-                ui.label(if snapshot.native_ready() {
+                ui.label(if !self.online {
+                    "本机后台离线（下方为上次后端状态）"
+                } else if snapshot.native_ready() {
                     "键鼠输入已就绪"
                 } else {
                     "键鼠输入尚未就绪"
@@ -1090,6 +1290,7 @@ impl BridgeApp {
                 .or_else(|| snapshot.clients.first().map(|(id, _, _)| *id));
             for (id, config, state) in &snapshot.clients {
                 let active = selected == Some(*id);
+                let report = feedback::device(snapshot, config, state, self.online);
                 egui::Frame::new()
                     .fill(if active { soft_accent(ui) } else { surface(ui) })
                     .stroke(Stroke::new(
@@ -1116,13 +1317,17 @@ impl BridgeApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.colored_label(
-                                        if state.alive { GREEN } else { MUTED },
-                                        if !state.active {
-                                            "已停用"
-                                        } else if state.alive {
-                                            "● 已连接"
-                                        } else {
-                                            "○ 等待"
+                                        tone_color(report.tone),
+                                        match report.phase {
+                                            feedback::Phase::Connecting => "正在连接",
+                                            feedback::Phase::Waiting => "等待确认",
+                                            feedback::Phase::Connected => "已连接",
+                                            feedback::Phase::Partial => "部分可用",
+                                            feedback::Phase::Failed => "连接失败",
+                                            feedback::Phase::NeedsTrust => "待配对",
+                                            feedback::Phase::Paused => "已暂停",
+                                            feedback::Phase::Disabled => "已停用",
+                                            feedback::Phase::Offline => "后台离线",
                                         },
                                     );
                                 },
@@ -1193,17 +1398,29 @@ impl BridgeApp {
                 });
                 ui.add_space(10.0);
                 ui.label(RichText::new("此设备的共享功能").strong());
+                let report = feedback::device(snapshot, config, state, self.online);
                 let mut sharing = config.sharing;
                 let mut changed = false;
                 ui.add_enabled_ui(self.online && !self.busy, |ui| {
-                    changed |= ui
-                        .checkbox(&mut sharing.mouse, "鼠标（移动、按键和滚轮）")
-                        .changed();
-                    changed |= ui.checkbox(&mut sharing.keyboard, "键盘").changed();
-                    changed |= ui
-                        .checkbox(&mut sharing.clipboard, "文字复制粘贴")
-                        .changed();
-                    changed |= ui.checkbox(&mut sharing.files, "文件复制粘贴").changed();
+                    for (index, (value, label)) in [
+                        (&mut sharing.mouse, "鼠标（移动、按键和滚轮）"),
+                        (&mut sharing.keyboard, "键盘"),
+                        (&mut sharing.clipboard, "文字复制粘贴"),
+                        (&mut sharing.files, "文件复制粘贴"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        ui.horizontal_wrapped(|ui| {
+                            changed |= ui.checkbox(value, label).changed();
+                            let capability = &report.capabilities[index];
+                            ui.label(
+                                RichText::new(&capability.reason)
+                                    .size(11.0)
+                                    .color(if capability.available { GREEN } else { MUTED }),
+                            );
+                        });
+                    }
                 });
                 if changed {
                     self.send(
@@ -1211,38 +1428,18 @@ impl BridgeApp {
                         "保存设备共享设置",
                     );
                 }
-                if snapshot.paused {
-                    ui.label("全局已暂停");
-                } else if !state.active {
-                    ui.label("设备已停用，四项共享均停止");
-                } else if let Some(error) = &state.sharing_error {
-                    ui.colored_label(RED, format!("连接或配对尚未就绪：{error}"));
-                } else if let Some(peer) = state.peer_sharing {
-                    if let Some(note) = &state.peer_note {
-                        ui.colored_label(MUTED, note);
-                    }
-                    let off = [
-                        (!peer.mouse, "鼠标"),
-                        (!peer.keyboard, "键盘"),
-                        (!peer.clipboard, "文字"),
-                        (!peer.files, "文件"),
-                    ]
-                    .into_iter()
-                    .filter_map(|(off, label)| off.then_some(label))
-                    .collect::<Vec<_>>();
-                    if !off.is_empty() {
-                        ui.label(format!("对端关闭：{}", off.join("、")));
-                    } else {
-                        ui.label("双方共享设置已确认");
-                    }
-                    if !snapshot.native_ready() {
-                        ui.label("键鼠权限尚未就绪；文字和文件共享独立运行");
-                    }
-                } else {
-                    ui.label(if config.fingerprint.is_none() {
-                        "请扫描配对设备，核对并保存对端指纹"
-                    } else {
-                        "等待对端确认共享设置（需要两端使用新版）"
+                ui.add_space(8.0);
+                ui.colored_label(
+                    tone_color(report.tone),
+                    RichText::new(&report.summary).strong(),
+                );
+                ui.label(RichText::new(&report.guidance).size(12.0).color(MUTED));
+                self.feedback_actions(ui, *id, config, state, &report.remedies);
+                if !report.details.is_empty() {
+                    ui.collapsing("错误技术详情", |ui| {
+                        for detail in &report.details {
+                            ui.label(RichText::new(detail).monospace().size(11.0));
+                        }
                     });
                 }
                 ui.collapsing("连接详情", |ui| {
@@ -1342,7 +1539,7 @@ impl BridgeApp {
                     format!("放在{}", edge_name(edge))
                 },
                 egui::FontId::proportional(11.0),
-                if client.is_some_and(|(_, _, s)| s.alive) {
+                if client.is_some_and(|(_, _, s)| feedback::connected(snapshot, s)) {
                     GREEN
                 } else {
                     MUTED
@@ -1353,7 +1550,11 @@ impl BridgeApp {
                 painter.circle_filled(
                     zone.right_top() + egui::vec2(-10.0, 10.0),
                     3.0,
-                    if state.alive { GREEN } else { MUTED },
+                    if feedback::connected(snapshot, state) {
+                        GREEN
+                    } else {
+                        MUTED
+                    },
                 );
             }
             if let Some((id, _, _)) = client {
@@ -1791,6 +1992,7 @@ impl BridgeApp {
             ));
             ui.label(format!("紧急释放：{}", snapshot.release_bind.join(" + ")));
             for (id, config, state) in &snapshot.clients {
+                let report = feedback::device(snapshot, config, state, self.online);
                 egui::Frame::new()
                     .fill(surface(ui))
                     .stroke(Stroke::new(1.0, border(ui)))
@@ -1804,6 +2006,18 @@ impl BridgeApp {
                             edge_name(config.pos)
                         ));
                         client_details(ui, config, state);
+                        ui.colored_label(tone_color(report.tone), &report.summary);
+                        ui.label(&report.guidance);
+                        for capability in &report.capabilities {
+                            ui.label(format!(
+                                "{}：{}",
+                                capability.feature.label(),
+                                capability.reason
+                            ));
+                        }
+                        for detail in &report.details {
+                            ui.monospace(detail);
+                        }
                     });
             }
         });
@@ -1855,12 +2069,12 @@ impl BridgeApp {
             ui,
             "TRUST",
             "设备授权",
-            "两台电脑需相互核对完整指纹并授权。",
+            "核对完整指纹；A 发起、B 允许后自动建立双向设备。",
         );
         ui.add_space(20.0);
         card(ui, |ui| {
             section_title(ui, "本机身份", "在另一台电脑上授权这个公开指纹");
-            ui.label("两台设备需相互授权。请在对方电脑上核对指纹后添加授权。");
+            ui.label("首次配对请在对端核对指纹并允许请求；无需在对端手动反向连接。");
             ui.monospace(&snapshot.fingerprint);
             if ui.button("复制本机指纹").clicked() {
                 ui.ctx().copy_text(snapshot.fingerprint.clone());
@@ -2138,6 +2352,7 @@ impl eframe::App for BridgeApp {
                     0.0,
                 );
                 self.header(ui);
+                self.connection_banner(ui);
                 self.permission_banner(ui);
                 if let Some(request) = self
                     .snapshot
@@ -2182,7 +2397,10 @@ impl eframe::App for BridgeApp {
                 }
                 scroll.show(ui, |ui| {
                     if self.tab == Tab::Files {
-                        if let Some(action) = self.files.show(ui, self.snapshot.as_ref()) {
+                        if let Some(action) =
+                            self.files
+                                .show(ui, self.snapshot.as_ref(), self.online, self.busy)
+                        {
                             self.send(action, "保存文件配置");
                         }
                         return;
@@ -2239,9 +2457,18 @@ impl eframe::App for BridgeApp {
         if self.permission_dialog_open {
             self.permission_dialog(&ctx);
         }
+        self.notifications(&ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.worker.stop();
+    }
+}
+fn tone_color(tone: Tone) -> Color32 {
+    match tone {
+        Tone::Neutral => MUTED,
+        Tone::Success => GREEN,
+        Tone::Warning => Color32::from_rgb(157, 106, 31),
+        Tone::Error => RED,
     }
 }
 fn monitor_stand(painter: &egui::Painter, screen: egui::Rect, color: Color32) {
@@ -2612,6 +2839,8 @@ pub(crate) mod tests {
             trust_name: String::new(),
             trust_fingerprint: String::new(),
             logs: VecDeque::new(),
+            feedback: feedback::Tracker::default(),
+            notifications: VecDeque::new(),
             privacy: privacy::PrivacyStatus {
                 supported: false,
                 accessibility: false,
@@ -2632,6 +2861,7 @@ pub(crate) mod tests {
     }
     pub(crate) fn snapshot() -> UiSnapshot {
         UiSnapshot {
+            control_error: None,
             pair_requests: vec![],
             clipboard_target: None,
             file_directory: String::new(),
@@ -2801,6 +3031,98 @@ pub(crate) mod tests {
         assert!(!app.busy && app.error);
         assert_eq!(app.form.unwrap().name, "draft");
         assert_eq!(app.message, "配置保存失败");
+    }
+    #[test]
+    fn saving_a_device_is_not_a_connection_success_notice() {
+        let (mut app, _, results) = fixture();
+        let mut state = snapshot();
+        state.platform = "macos".into();
+        state.clients[0].1.fingerprint = Some("peer-fingerprint".into());
+        state
+            .authorized
+            .insert("peer-fingerprint".into(), "peer".into());
+        state.clients[0].2.connection = Some(lan_mouse_ipc::ConnectionState::AwaitingConfirmation);
+        results
+            .send(Reply {
+                label: None,
+                result: Ok(state.clone()),
+            })
+            .unwrap();
+        app.receive();
+        results
+            .send(Reply {
+                label: Some("保存设备"),
+                result: Ok(state.clone()),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.message.contains("配置已保存"));
+        assert!(app.notifications.is_empty());
+        state.clients[0].2.connection = Some(lan_mouse_ipc::ConnectionState::Connected);
+        state.clients[0].2.peer_sharing = Some(Default::default());
+        state.capture = Status::Enabled;
+        state.emulation = Status::Enabled;
+        state.capture_backend = Some("macos".into());
+        state.emulation_backend = Some("macos".into());
+        results
+            .send(Reply {
+                label: None,
+                result: Ok(state.clone()),
+            })
+            .unwrap();
+        app.receive();
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.notice.id == Some(7) && n.notice.title.contains("连接已建立"))
+        );
+        let count = app.notifications.len();
+        results
+            .send(Reply {
+                label: None,
+                result: Ok(state),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.notifications.len(), count);
+    }
+    #[test]
+    fn connection_failure_repeats_keep_one_notice_and_a_persistent_device_reason() {
+        let (mut app, _, results) = fixture();
+        let mut state = snapshot();
+        state.platform = "macos".into();
+        state.clients[0].1.fingerprint = Some("peer-fingerprint".into());
+        state
+            .authorized
+            .insert("peer-fingerprint".into(), "peer".into());
+        results
+            .send(Reply {
+                label: None,
+                result: Ok(state.clone()),
+            })
+            .unwrap();
+        app.receive();
+        state.clients[0].2.connection = Some(lan_mouse_ipc::ConnectionState::Failed(
+            lan_mouse_ipc::ConnectionIssue::new(
+                lan_mouse_ipc::ConnectionIssueKind::Refused,
+                "connection refused",
+            ),
+        ));
+        for _ in 0..3 {
+            results
+                .send(Reply {
+                    label: None,
+                    result: Ok(state.clone()),
+                })
+                .unwrap();
+            app.receive();
+        }
+        assert_eq!(app.notifications.len(), 1);
+        app.notifications.clear(); // Dismissing the toast cannot erase the device failure.
+        let s = app.snapshot.as_ref().unwrap();
+        let report = feedback::device(s, &s.clients[0].1, &s.clients[0].2, app.online);
+        assert!(report.summary.contains("网络连接"));
+        assert!(report.remedies.contains(&Remedy::Retry));
     }
     #[test]
     fn diagnosis_agrees_with_cli_and_requires_an_identified_native_backend() {

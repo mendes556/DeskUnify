@@ -52,7 +52,7 @@ A 启动命令如下，B 换成 `machine-b.toml`。保持此终端运行：
 
 配对后文字和文件剪贴板由 daemon 自动运行，不要求键鼠权限；独立 `files` 命令仍保留，见 [文件传输](#文件传输)。
 
-默认构建不启用 GUI。无子命令或 `daemon` 都在前台运行后台；另开终端控制它。不要继续使用旧 GUI 启动的后台：先退出旧版本，再运行同版本 CLI/daemon。本地 IPC crate 为 0.6.0，协议为 7；键鼠 DTLS 事件格式未改变，新增独立配对/策略协商协议 `deskunify-control/1`（TCP：输入端口 + 2）。macOS/Windows 两端都需新版；Linux 保留原输入流程。
+默认构建不启用 GUI。无子命令或 `daemon` 都在前台运行后台；另开终端控制它。不要继续使用旧 GUI 启动的后台：先退出旧版本，再运行同版本 CLI/daemon。本地 IPC crate 为 0.6.0，协议为 8；键鼠 DTLS 事件格式未改变，新增独立配对/策略协商协议 `deskunify-control/1`（TCP：输入端口 + 2）。macOS/Windows 两端都需新版；Linux 保留原输入流程。
 
 ```sh
 ./target/debug/lan-mouse daemon
@@ -345,7 +345,10 @@ python3 scripts/package-desktop.py target/x86_64-apple-darwin/release/lan-mouse 
 - “保存当前配置到文件”：对应 `save-config`，保存后台已应用的配置；表单中尚未提交的草稿需先用对应保存按钮提交。
 - “退出后台并关闭窗口”：确认后正常停止共享、释放输入；也会停止从 CLI 启动的现有后台。关闭窗口仍沿用原有生命周期规则。
 
-扫描等待约 3 秒收集发现结果，并明确报告发现错误和设备数量；发现名称含空格时使用 IP 配对，避免把显示名称当作主机名。后端重试至少查询一次新状态，最多等待约 3 秒；仍为 dummy、未选择后端或初始化失败时不会显示就绪。所有修改先检查 IPC 版本，再发送关联请求；拒绝、保存失败、断开和超时均报告失败，保留编辑草稿。本地 IPC 7，新增独立配对协商协议；键鼠事件格式保持不变。`UiSnapshot::native_ready()`、`doctor_ready(local)` 为 CLI 与 GUI 提供共同的就绪判断。
+扫描等待约 3 秒收集发现结果，并明确报告发现错误和设备数量；发现名称含空格时使用 IP 配对，避免把显示名称当作主机名。后端重试至少查询一次新状态，最多等待约 3 秒；仍为 dummy、未选择后端或初始化失败时不会显示就绪。所有修改先检查 IPC 版本，再发送关联请求；拒绝、保存失败、断开和超时均报告失败，保留编辑草稿。本地 IPC 8，新增独立配对协商协议；键鼠事件格式保持不变。`UiSnapshot::native_ready()`、`doctor_ready(local)` 为 CLI 与 GUI 提供共同的就绪判断。
+
+连接反馈使用 IPC 8 的 `ClientState.connection` 与 `UiSnapshot.control_error`。认证控制通道的建立与键鼠通道的 `alive` 分开显示；发送配置或授权的回执不代表连接成功。请求发送后显示等待对端确认，成功、断开或可用能力变化会给出短暂提示和记录；相同原因的自动重试不会反复通知。设备卡片持续显示四项实际就绪状态、中文原因与相应处理入口，原始错误保留在技术详情。`RetryClient { id }` 只重试该设备的控制连接，不改变共享偏好或其他设备请求；等待确认的旧请求取消后会释放对端待确认资源。网络超时不能确定是防火墙、地址还是程序未启动；证书不匹配、协议不兼容、明确拒绝与本机服务错误分别提示。系统权限实际状态仍由现有原生后端检查。
+
 
 GUI 权限预检针对当前 GUI 进程。macOS 上由 GUI 自己启动的原生后台若因权限失败，界面会自动打开一次授权引导，并向系统请求辅助功能、输入监控及输入控制权限；系统弹窗仍需用户亲自允许。没有弹窗时可从引导窗口打开对应的系统设置，关闭引导后页面仍保留“处理权限”入口。授权状态变为齐全时自动重新检测后端；若有其他后台操作正在执行，会保留重检任务，等待操作完成后执行一次；若系统仍报告未就绪，完全退出应用后重新打开。显式 dummy 测试后端不会触发权限引导。已连接到 Terminal/iTerm 启动的 CLI 后台时不会自动申请 GUI 权限；页面会指出应授权启动后台的终端 App，并提供系统设置入口，GUI 自身的权限不能替代它。后台共享是否可用以实际输入后端状态为准。CLI 的有界 `test-capture` / `test-emulation` 仍用于独立输入测试，不在 GUI 中额外启动另一个原生输入后端。
 
@@ -421,7 +424,7 @@ cargo build -p lan-mouse --no-default-features --release --locked
 
 默认监听 `0.0.0.0:4243`，防火墙放行 TCP 4243；`receive --listen <IP:端口>` 可改地址，发送端 `--to` 填对应地址。它与键鼠 UDP 4242、文本剪贴板 TCP 4242 独立。`receive --once` 在一批文件成功后退出，失败连接不会消耗一次接收名额。接收未开启时发送明确失败，不自动打开远端目录写入权限。`files identity` 可以独立查看/生成本机公开指纹，不会启动原生键鼠后端。
 
-所有连接使用已有证书进行 TLS 1.3 双向身份认证；可用 `send --fingerprint "完整对端指纹"` 再锁定目标身份。接收进程监测配置中的授权变化，撤销授权后不再允许该设备提交文件。文件传输协议以独立 ALPN `lan-bridge-files/2` 标识，两端必须支持同一版本；键鼠 DTLS 事件格式不变，本机 IPC 升级为 7，新增独立控制协议 `deskunify-control/1`。
+所有连接使用已有证书进行 TLS 1.3 双向身份认证；可用 `send --fingerprint "完整对端指纹"` 再锁定目标身份。接收进程监测配置中的授权变化，撤销授权后不再允许该设备提交文件。文件传输协议以独立 ALPN `lan-bridge-files/2` 标识，两端必须支持同一版本；键鼠 DTLS 事件格式不变，本机 IPC 升级为 8，新增独立控制协议 `deskunify-control/1`。
 
 ### 传输、速度与恢复
 
@@ -493,4 +496,4 @@ cargo run --release -p lan-mouse --no-default-features --features egui --locked
 
 ## 名称与兼容性
 
-产品名为 DeskUnify（桌联），原工作名为 LAN Bridge。本版本保留 `lan-mouse` Rust crate / 可执行文件名、配置目录、已有证书、IPC 7、mDNS `_lanbridge._udp`、文件 ALPN `lan-bridge-files/2` 和既有应用标识，避免改名导致重新配对或协议不兼容。GUI 窗口、权限说明和新打包文件显示 DeskUnify；系统中旧包可能仍显示 LAN Bridge。macOS 的实际权限是否有效仍以当前运行签名和系统检查为准，改名不能修复此前的临时签名权限问题。
+产品名为 DeskUnify（桌联），原工作名为 LAN Bridge。本版本保留 `lan-mouse` Rust crate / 可执行文件名、配置目录、已有证书、IPC 8、mDNS `_lanbridge._udp`、文件 ALPN `lan-bridge-files/2` 和既有应用标识，避免改名导致重新配对或协议不兼容。GUI 窗口、权限说明和新打包文件显示 DeskUnify；系统中旧包可能仍显示 LAN Bridge。macOS 的实际权限是否有效仍以当前运行签名和系统检查为准，改名不能修复此前的临时签名权限问题。

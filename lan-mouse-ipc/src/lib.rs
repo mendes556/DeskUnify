@@ -59,7 +59,7 @@ pub enum IpcError {
 
 pub const DEFAULT_PORT: u16 = 4242;
 /// Local IPC schema version. UI and daemon must use matching builds.
-pub const IPC_VERSION: u32 = 7;
+pub const IPC_VERSION: u32 = 8;
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -212,8 +212,92 @@ impl Default for ClientConfig {
 
 pub type ClientHandle = u64;
 
+/// The authenticated control connection is separate from physical input readiness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "issue", rename_all = "snake_case")]
+pub enum ConnectionState {
+    Connecting,
+    AwaitingConfirmation,
+    Connected,
+    Failed(ConnectionIssue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionIssueKind {
+    Timeout,
+    ConfirmationTimeout,
+    ConfirmationPending,
+    Refused,
+    Unreachable,
+    IdentityMismatch,
+    ProtocolMismatch,
+    Rejected,
+    Interrupted,
+    LocalService,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+#[error("{detail}")]
+pub struct ConnectionIssue {
+    pub kind: ConnectionIssueKind,
+    pub detail: String,
+}
+
+impl ConnectionIssue {
+    pub fn new(kind: ConnectionIssueKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn summary(&self) -> &'static str {
+        match self.kind {
+            ConnectionIssueKind::Timeout => "未收到对端响应，连接超时",
+            ConnectionIssueKind::ConfirmationTimeout => "等待对端确认超时",
+            ConnectionIssueKind::ConfirmationPending => "等待对端确认配对",
+            ConnectionIssueKind::Refused => "对端拒绝了网络连接",
+            ConnectionIssueKind::Unreachable => "无法到达对端网络地址",
+            ConnectionIssueKind::IdentityMismatch => "对端证书身份校验失败",
+            ConnectionIssueKind::ProtocolMismatch => "两端连接协议不兼容",
+            ConnectionIssueKind::Rejected => "对端未允许此次配对",
+            ConnectionIssueKind::Interrupted => "与对端的连接已中断",
+            ConnectionIssueKind::LocalService => "本机配对服务未就绪",
+            ConnectionIssueKind::Other => "连接未能完成",
+        }
+    }
+
+    pub fn guidance(&self) -> &'static str {
+        match self.kind {
+            ConnectionIssueKind::Timeout | ConnectionIssueKind::Unreachable => {
+                "请检查对端是否启动 DeskUnify、IP 是否正确、两台设备的网络和防火墙；当前不能确定是哪一项导致。"
+            }
+            ConnectionIssueKind::ConfirmationTimeout | ConnectionIssueKind::ConfirmationPending => {
+                "请求已发出；首次配对请在对端点击允许，然后重试。也请确认对端程序仍在运行。"
+            }
+            ConnectionIssueKind::Refused => {
+                "请确认对端后台已启动且端口正确；防火墙拒绝连接也可能产生此结果。"
+            }
+            ConnectionIssueKind::IdentityMismatch => {
+                "请在对端查看当前完整指纹并重新核对配对信息；证书更新可能需要重新授权。"
+            }
+            ConnectionIssueKind::ProtocolMismatch => "请将两台设备更新到兼容版本，再重新连接。",
+            ConnectionIssueKind::Rejected => "请在对端查看配对或设备授权，确认允许这台电脑后重试。",
+            ConnectionIssueKind::Interrupted => "请确认对端未退出或休眠、网络仍连通，然后重试。",
+            ConnectionIssueKind::LocalService => {
+                "请查看下方技术详情，检查端口占用或证书错误；处理后重新启动本机后台。"
+            }
+            ConnectionIssueKind::Other => "请查看技术详情，并检查两端程序、网络和配对状态后重试。",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
+    #[serde(default)]
+    pub connection: Option<ConnectionState>,
     #[serde(default)]
     pub peer_sharing: Option<Sharing>,
     #[serde(default)]
@@ -394,6 +478,9 @@ pub enum UiAction {
         id: ClientHandle,
         active: bool,
     },
+    RetryClient {
+        id: ClientHandle,
+    },
     Authorize {
         description: String,
         fingerprint: String,
@@ -432,6 +519,8 @@ pub struct DiscoveredDevice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSnapshot {
     #[serde(default)]
+    pub control_error: Option<ConnectionIssue>,
+    #[serde(default)]
     pub pair_requests: Vec<PairRequest>,
     #[serde(default)]
     pub clipboard_target: Option<ClientHandle>,
@@ -468,6 +557,15 @@ pub fn native_backend_ready(status: Status, backend: Option<&str>) -> bool {
 }
 
 impl UiSnapshot {
+    pub fn control_connected(&self, state: &ClientState) -> bool {
+        if matches!(self.platform.as_str(), "macos" | "windows") {
+            matches!(state.connection, Some(ConnectionState::Connected))
+                && state.peer_sharing.is_some()
+                && state.sharing_error.is_none()
+        } else {
+            state.alive
+        }
+    }
     pub fn native_ready(&self) -> bool {
         native_backend_ready(self.capture, self.capture_backend.as_deref())
             && native_backend_ready(self.emulation, self.emulation_backend.as_deref())
@@ -478,10 +576,9 @@ impl UiSnapshot {
         self.native_ready()
             && !self.paused
             && (local
-                || self
-                    .clients
-                    .iter()
-                    .any(|(_, _, state)| state.active && state.alive))
+                || self.clients.iter().any(|(_, _, state)| {
+                    state.active && state.alive && self.control_connected(state)
+                }))
     }
 }
 

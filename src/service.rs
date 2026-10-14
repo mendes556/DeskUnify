@@ -54,6 +54,7 @@ pub struct Service {
         (
             lan_mouse_ipc::PairRequest,
             lan_mouse_ipc::Sharing,
+            Option<String>,
             tokio::sync::oneshot::Sender<crate::control::Reply>,
         ),
     >,
@@ -461,12 +462,36 @@ impl Service {
     async fn handle_control_event(&mut self, event: crate::control::Event) {
         use crate::control::{Event, Reply};
         match event {
+            Event::Listening => self.ui.control_error = None,
+            Event::AwaitingConfirmation { id, fingerprint } => {
+                if let Some((_, mut s)) = self.client_manager.get_state(id).filter(|(c, _)| {
+                    c.fingerprint.as_deref() == Some(&fingerprint)
+                        && self
+                            .authorized_keys
+                            .read()
+                            .expect("lock")
+                            .contains_key(&fingerprint)
+                }) {
+                    // Keep an established connection or a failure visible during background retries.
+                    if s.connection.is_none()
+                        || matches!(
+                            s.connection,
+                            Some(lan_mouse_ipc::ConnectionState::Connecting)
+                        )
+                    {
+                        s.connection = Some(lan_mouse_ipc::ConnectionState::AwaitingConfirmation);
+                        self.client_manager.set_state(id, s);
+                    }
+                }
+            }
             Event::Request {
                 request,
                 sharing,
                 note,
                 reply,
             } => {
+                self.pair_requests
+                    .retain(|_, (_, _, _, reply)| !reply.is_closed());
                 let fp = request.fingerprint.clone();
                 if self.rejected_pairs.contains(&fp)
                     || (self.client_manager.by_fingerprint(&fp).is_some()
@@ -479,6 +504,7 @@ impl Service {
                         s.peer_sharing = Some(sharing);
                         s.peer_note = note;
                         s.sharing_error = None;
+                        s.connection = Some(lan_mouse_ipc::ConnectionState::Connected);
                         self.client_manager.set_state(id, s.clone());
                         self.peer_seen.insert(fp, std::time::Instant::now());
                         let mut response = Reply::accepted(if s.active && !self.ui.paused {
@@ -490,7 +516,8 @@ impl Service {
                         let _ = reply.send(response);
                     }
                 } else if self.pair_requests.len() < 16 && !self.pair_requests.contains_key(&fp) {
-                    self.pair_requests.insert(fp, (request, sharing, reply));
+                    self.pair_requests
+                        .insert(fp, (request, sharing, note, reply));
                 } else {
                     let _ = reply.send(Reply::rejected("已有待确认请求，请在对端确认配对"));
                 }
@@ -500,23 +527,28 @@ impl Service {
                 fingerprint,
                 result,
             } => {
-                if let Some((c, mut s)) = self
-                    .client_manager
-                    .get_state(id)
-                    .filter(|(c, _)| c.fingerprint.as_deref() == Some(&fingerprint))
-                {
+                if let Some((c, mut s)) = self.client_manager.get_state(id).filter(|(c, _)| {
+                    c.fingerprint.as_deref() == Some(&fingerprint)
+                        && self
+                            .authorized_keys
+                            .read()
+                            .expect("lock")
+                            .contains_key(&fingerprint)
+                }) {
                     match result {
                         Ok(response) => {
                             s.peer_sharing = Some(response.sharing);
                             s.peer_note = response.note;
                             s.peer_addr = response.verified_addr;
                             s.sharing_error = None;
+                            s.connection = Some(lan_mouse_ipc::ConnectionState::Connected);
                             self.peer_seen
                                 .insert(fingerprint, std::time::Instant::now());
                         }
                         Err(error) => {
                             s.peer_sharing = None;
-                            s.sharing_error = Some(error);
+                            s.sharing_error = Some(error.to_string());
+                            s.connection = Some(lan_mouse_ipc::ConnectionState::Failed(error));
                             self.peer_seen.remove(&fingerprint);
                         }
                     }
@@ -524,10 +556,16 @@ impl Service {
                     let _ = c;
                 }
             }
-            Event::Error(error) => log::warn!("pairing service: {error}"),
+            Event::Error(error) => {
+                log::warn!("pairing service: {error}");
+                self.ui.control_error = Some(lan_mouse_ipc::ConnectionIssue::new(
+                    lan_mouse_ipc::ConnectionIssueKind::LocalService,
+                    error,
+                ));
+            }
         }
         self.pair_requests
-            .retain(|_, (_, _, reply)| !reply.is_closed());
+            .retain(|_, (_, _, _, reply)| !reply.is_closed());
         self.configure_sharing();
     }
     #[cfg(any(target_os = "macos", windows))]
@@ -592,10 +630,13 @@ impl Service {
     #[cfg(any(target_os = "macos", windows))]
     fn approve_pair(&mut self, fp: &str) {
         self.rejected_pairs.remove(fp);
-        if let Some((request, sharing, reply)) = self.pair_requests.remove(fp) {
+        if let Some((request, sharing, note, reply)) = self.pair_requests.remove(fp) {
             let id = self.ensure_reverse_client(&request);
             let (c, mut s) = self.client_manager.get_state(id).expect("paired client");
             s.peer_sharing = Some(sharing);
+            s.peer_note = note;
+            s.sharing_error = None;
+            s.connection = Some(lan_mouse_ipc::ConnectionState::Connected);
             self.client_manager.set_state(id, s.clone());
             self.peer_seen
                 .insert(fp.to_owned(), std::time::Instant::now());
@@ -962,10 +1003,24 @@ impl Service {
     fn remove_authorized_key(&mut self, fp: String) {
         self.rejected_pairs.insert(fp.clone());
         #[cfg(any(target_os = "macos", windows))]
-        if let Some((_, _, reply)) = self.pair_requests.remove(&fp) {
+        if let Some((_, _, _, reply)) = self.pair_requests.remove(&fp) {
             let _ = reply.send(crate::control::Reply::rejected("设备授权已撤销"));
         }
         self.authorized_keys.write().expect("lock").remove(&fp);
+        self.peer_seen.remove(&fp);
+        for (id, c, mut s) in self.client_manager.get_client_states() {
+            if c.fingerprint.as_deref() == Some(&fp) {
+                s.peer_sharing = None;
+                s.sharing_error = Some("本机已撤销此设备的授权".into());
+                s.connection = Some(lan_mouse_ipc::ConnectionState::Failed(
+                    lan_mouse_ipc::ConnectionIssue::new(
+                        lan_mouse_ipc::ConnectionIssueKind::Rejected,
+                        "local authorization revoked",
+                    ),
+                ));
+                self.client_manager.set_state(id, s);
+            }
+        }
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }

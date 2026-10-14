@@ -309,7 +309,10 @@ fn status(s: &UiSnapshot) -> Result<(), CliError> {
     text(format!(
         "设备 {} · 已连接 {} · 授权 {} · 剪贴板 {}",
         s.clients.len(),
-        s.clients.iter().filter(|(_, _, s)| s.alive).count(),
+        s.clients
+            .iter()
+            .filter(|(_, _, state)| s.control_connected(state))
+            .count(),
         s.authorized.len(),
         s.clipboard
     ))?;
@@ -317,6 +320,14 @@ fn status(s: &UiSnapshot) -> Result<(), CliError> {
     text(format!("配置文件: {}", s.config_path))?;
     if let Some(error) = &s.discovery_error {
         text(format!("发现错误: {error}"))?;
+    }
+    if let Some(issue) = &s.control_error {
+        text(format!(
+            "配对服务：{}；{}\n  {}",
+            issue.summary(),
+            issue.guidance(),
+            issue.detail
+        ))?;
     }
     Ok(())
 }
@@ -340,11 +351,12 @@ fn list(s: &UiSnapshot) -> Result<(), CliError> {
     }
     for (id, c, state) in &s.clients {
         text(format!(
-            "id {id}: {}:{} ({}) active={} connected={} ips={:?}",
+            "id {id}: {}:{} ({}) active={} connected={} input_connected={} ips={:?}",
             display_name(c),
             c.port,
             c.pos,
             state.active,
+            s.control_connected(state),
             state.alive,
             c.fix_ips
         ))?;
@@ -356,7 +368,14 @@ fn list(s: &UiSnapshot) -> Result<(), CliError> {
             c.sharing.files,
             state.peer_sharing
         ))?;
-        if let Some(note) = state.peer_note.as_ref().or(state.sharing_error.as_ref()) {
+        if let Some(lan_mouse_ipc::ConnectionState::Failed(issue)) = &state.connection {
+            text(format!(
+                "  连接：{}；{}\n  技术详情：{}",
+                issue.summary(),
+                issue.guidance(),
+                clean(&issue.detail)
+            ))?;
+        } else if let Some(note) = state.peer_note.as_ref().or(state.sharing_error.as_ref()) {
             text(format!("  {note}"))?;
         }
     }
@@ -408,7 +427,7 @@ fn doctor(s: &UiSnapshot, local: bool) -> Result<(), CliError> {
         text("当前已暂停，请运行 cli resume")?;
         return Err(CliError::NotReady);
     }
-    if !local && !s.clients.iter().any(|(_, _, s)| s.active && s.alive) {
+    if !s.doctor_ready(local) {
         text("没有已连接的启用设备。两端运行 daemon，核对双方指纹并相互授权后再检查。")?;
         return Err(CliError::NotReady);
     }
@@ -674,6 +693,7 @@ mod tests {
     use lan_mouse_ipc::Status;
     fn snapshot() -> UiSnapshot {
         UiSnapshot {
+            control_error: None,
             pair_requests: vec![],
             clipboard_target: None,
             file_directory: String::new(),

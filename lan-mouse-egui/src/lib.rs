@@ -1,5 +1,6 @@
 // DeskUnify changes, 2026-10-01; derived from Lan Mouse, GPL-3.0-or-later.
 mod app;
+mod feedback;
 mod privacy;
 mod transport;
 use eframe::egui;

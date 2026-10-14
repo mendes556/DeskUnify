@@ -4,7 +4,9 @@ use crate::{
     clipboard::tls::{Authorized, TlsConfig},
     crypto,
 };
-use lan_mouse_ipc::{ClientHandle, PairRequest, Position, Sharing};
+use lan_mouse_ipc::{
+    ClientHandle, ConnectionIssue, ConnectionIssueKind, PairRequest, Position, Sharing,
+};
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,6 +78,11 @@ impl Reply {
     }
 }
 pub(crate) enum Event {
+    AwaitingConfirmation {
+        id: ClientHandle,
+        fingerprint: String,
+    },
+    Listening,
     Request {
         request: PairRequest,
         sharing: Sharing,
@@ -85,11 +92,12 @@ pub(crate) enum Event {
     Updated {
         id: ClientHandle,
         fingerprint: String,
-        result: Result<Reply, String>,
+        result: Result<Reply, ConnectionIssue>,
     },
     Error(String),
 }
 pub(crate) struct Control {
+    retries: mpsc::Sender<ClientHandle>,
     settings: watch::Sender<Settings>,
     events: mpsc::Receiver<Event>,
     task: JoinHandle<()>,
@@ -98,12 +106,19 @@ impl Control {
     pub fn new(cert: Certificate, keys: Authorized) -> Self {
         let (settings, rx) = watch::channel(Settings::default());
         let (tx, events) = mpsc::channel(32);
-        let task = tokio::task::spawn_local(run(cert, keys, rx, tx));
+        let (retries, retry_rx) = mpsc::channel(16);
+        let task = tokio::task::spawn_local(run(cert, keys, rx, tx, retry_rx));
         Self {
+            retries,
             settings,
             events,
             task,
         }
+    }
+    pub fn retry(&self, id: ClientHandle) -> Result<(), String> {
+        self.retries
+            .try_send(id)
+            .map_err(|_| "重试请求尚未提交，请稍后重试".into())
     }
     pub fn configure(&self, value: Settings) {
         self.settings.send_if_modified(|old| {
@@ -188,20 +203,52 @@ async fn accept(
     })
     .await
     .map_err(io::Error::other)?;
-    let response = tokio::time::timeout(Duration::from_secs(60), response)
-        .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
+    // A cancelled requester must not leave a stale approval occupying the peer.
+    let response = tokio::select! {
+        reply = tokio::time::timeout(Duration::from_secs(60), response) => {
+            match reply {
+                Ok(reply) => reply.map_err(io::Error::other)?,
+                Err(_) => Reply::rejected("等待配对确认超时"),
+            }
+        },
+        extra = stream.read_u8() => {
+            return Err(extra.err().unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unexpected control data while awaiting approval")));
+        }
+    };
     frame_write(&mut stream, &response).await
 }
-async fn exchange(tls: TlsConfig, peer: Peer, port: u16) -> io::Result<Reply> {
-    let control_port = peer
-        .addr
-        .port()
-        .checked_add(2)
-        .ok_or_else(|| io::Error::other("control port overflow"))?;
+fn transport_issue(error: io::Error) -> ConnectionIssue {
+    let kind = match error.kind() {
+        io::ErrorKind::TimedOut => ConnectionIssueKind::Timeout,
+        io::ErrorKind::ConnectionRefused => ConnectionIssueKind::Refused,
+        io::ErrorKind::NotConnected
+        | io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::HostUnreachable => ConnectionIssueKind::Unreachable,
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => ConnectionIssueKind::Interrupted,
+        _ => ConnectionIssueKind::Other,
+    };
+    ConnectionIssue::new(kind, error.to_string())
+}
+
+async fn exchange(
+    tls: TlsConfig,
+    peer: Peer,
+    port: u16,
+    progress: Option<mpsc::Sender<Event>>,
+) -> Result<Reply, ConnectionIssue> {
+    let control_port =
+        peer.addr.port().checked_add(2).ok_or_else(|| {
+            ConnectionIssue::new(ConnectionIssueKind::Other, "control port overflow")
+        })?;
     let mut connected = None;
-    let mut last_error = io::Error::other("no reachable control address");
+    let mut last_error = ConnectionIssue::new(
+        ConnectionIssueKind::Unreachable,
+        "no reachable control address",
+    );
     for addr in std::iter::once(peer.addr).chain(peer.alternates.iter().copied()) {
         match tokio::time::timeout(
             Duration::from_secs(2),
@@ -213,26 +260,65 @@ async fn exchange(tls: TlsConfig, peer: Peer, port: u16) -> io::Result<Reply> {
                 connected = Some(socket);
                 break;
             }
-            Ok(Err(error)) => last_error = error,
-            Err(error) => last_error = io::Error::other(error),
+            Ok(Err(error)) => last_error = transport_issue(error),
+            Err(error) => {
+                last_error = ConnectionIssue::new(ConnectionIssueKind::Timeout, error.to_string())
+            }
         }
     }
     let socket = connected.ok_or(last_error)?;
-    let verified_addr = SocketAddr::new(socket.peer_addr()?.ip(), peer.addr.port());
-    socket.set_nodelay(true)?;
-    let mut stream = TlsConnector::from(tls.client)
-        .connect(
+    let verified_addr = SocketAddr::new(
+        socket.peer_addr().map_err(transport_issue)?.ip(),
+        peer.addr.port(),
+    );
+    socket.set_nodelay(true).map_err(transport_issue)?;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TlsConnector::from(tls.client).connect(
             ServerName::try_from("deskunify.local").unwrap().to_owned(),
             socket,
-        )
-        .await?;
+        ),
+    )
+    .await
+    .map_err(|e| ConnectionIssue::new(ConnectionIssueKind::Timeout, format!("TLS handshake: {e}")))?
+    .map_err(|e| {
+        let tls = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+        let kind = match tls {
+            Some(rustls::Error::InvalidCertificate(_)) => {
+                Some(ConnectionIssueKind::IdentityMismatch)
+            }
+            Some(rustls::Error::General(message)) if message == "unpaired DeskUnify peer" => {
+                Some(ConnectionIssueKind::IdentityMismatch)
+            }
+            Some(rustls::Error::NoApplicationProtocol) => {
+                Some(ConnectionIssueKind::ProtocolMismatch)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            ConnectionIssue::new(kind, e.to_string())
+        } else {
+            transport_issue(e)
+        }
+    })?;
     let conn = stream.get_ref().1;
     let fingerprint = conn
         .peer_certificates()
         .and_then(|c| c.first())
         .map(|c| crypto::generate_fingerprint(c.as_ref()));
-    if conn.alpn_protocol() != Some(ALPN) || fingerprint.as_deref() != Some(&peer.fingerprint) {
-        return Err(io::Error::other("peer identity mismatch"));
+    if fingerprint.as_deref() != Some(&peer.fingerprint) {
+        return Err(ConnectionIssue::new(
+            ConnectionIssueKind::IdentityMismatch,
+            "peer identity mismatch",
+        ));
+    }
+    if conn.alpn_protocol() != Some(ALPN) {
+        return Err(ConnectionIssue::new(
+            ConnectionIssueKind::ProtocolMismatch,
+            "unsupported control protocol",
+        ));
     }
     frame_write(
         &mut stream,
@@ -244,13 +330,38 @@ async fn exchange(tls: TlsConfig, peer: Peer, port: u16) -> io::Result<Reply> {
             note: peer.note,
         },
     )
-    .await?;
-    let mut response: Reply = frame_read(&mut stream).await?;
+    .await
+    .map_err(transport_issue)?;
+    if let Some(tx) = progress {
+        let _ = tx
+            .send(Event::AwaitingConfirmation {
+                id: peer.id,
+                fingerprint: peer.fingerprint,
+            })
+            .await;
+    }
+    let mut response: Reply =
+        tokio::time::timeout(Duration::from_secs(61), frame_read(&mut stream))
+            .await
+            .map_err(|e| {
+                ConnectionIssue::new(ConnectionIssueKind::ConfirmationTimeout, e.to_string())
+            })?
+            .map_err(transport_issue)?;
     if response.version != VERSION {
-        return Err(io::Error::other("unsupported control version"));
+        return Err(ConnectionIssue::new(
+            ConnectionIssueKind::ProtocolMismatch,
+            "unsupported control version",
+        ));
     }
     if let Some(error) = &response.error {
-        return Err(io::Error::other(error.clone()));
+        let kind = if error.starts_with("已有待确认请求") {
+            ConnectionIssueKind::ConfirmationPending
+        } else if error == "等待配对确认超时" {
+            ConnectionIssueKind::ConfirmationTimeout
+        } else {
+            ConnectionIssueKind::Rejected
+        };
+        return Err(ConnectionIssue::new(kind, error.clone()));
     }
     response.verified_addr = Some(verified_addr);
     Ok(response)
@@ -260,6 +371,7 @@ async fn run(
     keys: Authorized,
     mut settings: watch::Receiver<Settings>,
     tx: mpsc::Sender<Event>,
+    mut retries: mpsc::Receiver<ClientHandle>,
 ) {
     let tls = match TlsConfig::control(&cert, keys, ALPN) {
         Ok(tls) => tls,
@@ -270,7 +382,8 @@ async fn run(
     };
     let mut tasks = JoinSet::new();
     let mut polls = JoinSet::new();
-    let mut busy = std::collections::HashSet::new();
+    let mut busy: std::collections::HashMap<ClientHandle, tokio::task::AbortHandle> =
+        std::collections::HashMap::new();
     let mut listener = None;
     let mut port = 0;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -281,7 +394,10 @@ async fn run(
             port = current.port;
             listener = if let Some(p) = port.checked_add(2).filter(|_| port != 0) {
                 match TcpListener::bind(("0.0.0.0", p)).await {
-                    Ok(l) => Some(l),
+                    Ok(l) => {
+                        let _ = tx.send(Event::Listening).await;
+                        Some(l)
+                    }
                     Err(e) => {
                         let _ = tx.send(Event::Error(format!("配对端口 {p}: {e}"))).await;
                         None
@@ -293,13 +409,20 @@ async fn run(
         }
         tokio::select! {
             changed = settings.changed() => { if changed.is_err() { break; } },
+            Some(id) = retries.recv() => {
+                if let Some(task) = busy.remove(&id) { task.abort(); }
+                tick.reset_immediately();
+            },
             _ = tick.tick() => {
                 for peer in current.peers {
-                    if busy.insert(peer.id) {
+                    if !busy.contains_key(&peer.id) {
                         let tls = tls.clone(); let port = current.port;
-                        polls.spawn(async move { let id=peer.id; let fingerprint=peer.fingerprint.clone();
-                            let result = tokio::time::timeout(Duration::from_secs(65),exchange(tls,peer,port)).await.map_err(|e|e.to_string()).and_then(|r|r.map_err(|e|e.to_string()));
+                        let progress = tx.clone(); let id = peer.id;
+                        let task = polls.spawn(async move { let fingerprint=peer.fingerprint.clone();
+                            let result = tokio::time::timeout(Duration::from_secs(75),exchange(tls,peer,port,Some(progress))).await
+                                .map_err(|e| ConnectionIssue::new(ConnectionIssueKind::Timeout, e.to_string())).and_then(|r|r);
                             (id,fingerprint,result) });
+                        busy.insert(id, task);
                     }
                 }
             },
@@ -307,7 +430,17 @@ async fn run(
                 if let Ok((socket, addr)) = connection { if tasks.len() < 16 { let tls=tls.clone(); let tx=tx.clone(); tasks.spawn(accept(socket,addr.ip(),tls,tx)); } }
             },
             Some(_) = tasks.join_next() => {},
-            Some(result) = polls.join_next() => { if let Ok((id,fingerprint,result)) = result { busy.remove(&id); let _=tx.send(Event::Updated{id,fingerprint,result}).await; } },
+            Some(result) = polls.join_next_with_id() => {
+                if let Ok((task_id,(id,fingerprint,result))) = result {
+                    // A cancelled old request must not clear or overwrite a newer retry.
+                    if busy.get(&id).is_some_and(|task| task.id() == task_id) {
+                        busy.remove(&id); let _=tx.send(Event::Updated{id,fingerprint,result}).await;
+                    }
+                }
+                else if let Err(error) = result {
+                    busy.retain(|_, task| task.id() != error.id());
+                }
+            },
         }
     }
 }
@@ -340,6 +473,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
+        let (progress, mut stages) = mpsc::channel(1);
         let receiver = tokio::spawn(async move {
             let (socket, peer) = listener.accept().await.unwrap();
             accept(socket, peer.ip(), server, tx).await
@@ -353,7 +487,7 @@ mod tests {
             sharing: Sharing::OFF,
             note: None,
         };
-        let sender = tokio::spawn(exchange(client.clone(), peer.clone(), 4242));
+        let sender = tokio::spawn(exchange(client.clone(), peer.clone(), 4242, Some(progress)));
         match rx.recv().await.unwrap() {
             Event::Request {
                 request,
@@ -365,6 +499,10 @@ mod tests {
                 assert_eq!(request.port, 4242);
                 assert_eq!(request.position, Position::Right);
                 assert_eq!(sharing, Sharing::OFF);
+                assert!(matches!(
+                    stages.recv().await,
+                    Some(Event::AwaitingConfirmation { id: 0, .. })
+                ));
                 reply.send(Reply::rejected("denied")).unwrap();
             }
             _ => panic!("unexpected event"),
@@ -390,7 +528,7 @@ mod tests {
         wrong.addr = SocketAddr::new(addr.ip(), addr.port() - 2);
         wrong.fingerprint = afp;
         assert!(
-            exchange(client, wrong, 4242)
+            exchange(client, wrong, 4242, None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -399,5 +537,21 @@ mod tests {
         assert!(rx.try_recv().is_err());
         receiver.abort();
         let _ = receiver.await;
+    }
+
+    #[test]
+    fn socket_failures_have_stable_categories() {
+        assert_eq!(
+            transport_issue(io::ErrorKind::ConnectionRefused.into()).kind,
+            ConnectionIssueKind::Refused
+        );
+        assert_eq!(
+            transport_issue(io::ErrorKind::TimedOut.into()).kind,
+            ConnectionIssueKind::Timeout
+        );
+        assert_eq!(
+            transport_issue(io::ErrorKind::ConnectionReset.into()).kind,
+            ConnectionIssueKind::Interrupted
+        );
     }
 }

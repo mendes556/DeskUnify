@@ -125,6 +125,7 @@ mod tests {
         old.protocol_version -= 1;
         let mut wire = serde_json::to_value(&old).unwrap();
         for field in [
+            "control_error",
             "pair_requests",
             "clipboard_target",
             "file_directory",
@@ -132,6 +133,10 @@ mod tests {
         ] {
             wire.as_object_mut().unwrap().remove(field);
         }
+        wire["clients"][0][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("connection");
         let old = serde_json::from_value(wire).unwrap();
         let mut events = stream::iter([Ok(FrontendEvent::UiResult {
             id: "mine".into(),

@@ -1,7 +1,10 @@
 //! Two isolated dummy daemons. No OS input or system clipboard is touched:
 //! the initiating peer disables text/files before the pair can become effective.
 #![cfg(target_os = "macos")]
-use lan_mouse_ipc::{FrontendEvent, FrontendRequest, Sharing, UiAction, UiSnapshot};
+use lan_mouse_ipc::{
+    ConnectionIssueKind, ConnectionState, FrontendEvent, FrontendRequest, Sharing, UiAction,
+    UiSnapshot,
+};
 use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,
@@ -142,6 +145,29 @@ fn one_sided_pairing_negotiates_policies_and_preserves_them_on_restart() {
     assert_eq!(pending.pair_requests[0].fingerprint, afp);
     assert!(pending.clients.is_empty());
     assert!(pending.authorized.is_empty());
+    let awaiting = daemons[0].wait(|s| {
+        matches!(
+            s.clients[0].2.connection,
+            Some(ConnectionState::AwaitingConfirmation)
+        )
+    });
+    assert!(!awaiting.clients[0].2.alive); // Approval is distinct from an input channel.
+    let retry = daemons[0].action(UiAction::RetryClient { id: 0 });
+    assert!(matches!(
+        retry.clients[0].2.connection,
+        Some(ConnectionState::Connecting)
+    ));
+    daemons[0].wait(|s| {
+        matches!(
+            s.clients[0].2.connection,
+            Some(ConnectionState::AwaitingConfirmation)
+                | Some(ConnectionState::Failed(lan_mouse_ipc::ConnectionIssue {
+                    kind: ConnectionIssueKind::ConfirmationPending,
+                    ..
+                }))
+        )
+    });
+    daemons[1].wait(|s| !s.pair_requests.is_empty());
     daemons[1].action(UiAction::RejectPair {
         fingerprint: afp.clone(),
     });
@@ -152,6 +178,7 @@ fn one_sided_pairing_negotiates_policies_and_preserves_them_on_restart() {
             && rejected.authorized.is_empty()
             && rejected.pair_requests.is_empty()
     );
+    daemons[0].wait(|s| matches!(&s.clients[0].2.connection, Some(ConnectionState::Failed(issue)) if issue.kind == ConnectionIssueKind::Rejected));
     daemons[1].action(UiAction::Authorize {
         description: "A".into(),
         fingerprint: afp.clone(),
@@ -166,6 +193,12 @@ fn one_sided_pairing_negotiates_policies_and_preserves_them_on_restart() {
     assert_eq!(paired.clients[0].1.sharing, Sharing::default());
     assert!(paired.clients[0].2.active);
     daemons[0].wait(|s| s.clients[0].2.peer_sharing == Some(Sharing::default()));
+    assert!(matches!(
+        daemons[0].action(UiAction::Snapshot).clients[0]
+            .2
+            .connection,
+        Some(ConnectionState::Connected)
+    ));
     let a_policy = Sharing {
         keyboard: true,
         ..Sharing::OFF
@@ -194,6 +227,7 @@ fn one_sided_pairing_negotiates_policies_and_preserves_them_on_restart() {
     });
     daemons[0].wait(|s| s.clients[0].2.peer_sharing == Some(Sharing::OFF));
     daemons[1].stop();
+    daemons[0].wait(|s| matches!(s.clients[0].2.connection, Some(ConnectionState::Failed(_))));
     daemons[1].start();
     let saved = daemons[1].action(UiAction::Snapshot);
     assert_eq!(saved.clients.len(), 1);
